@@ -10,7 +10,7 @@ LOG_MODULE_REGISTER(main_m);
 // --- static functions declarations -------------------------------------------
 
 // --- static variables definitions --------------------------------------------
- 
+
 // --- structs -----------------------------------------------------------------
 
 // --- static functions definitions --------------------------------------------
@@ -20,5 +20,7 @@ int
 main(void)
 {
     ble_conn_control_start();
-    return;
+    // TODO: At this point main is already blocked by ble_conn_control_start.
+    // I need to set up a new thread for that.
+    return 0;
 }

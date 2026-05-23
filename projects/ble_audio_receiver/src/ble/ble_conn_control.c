@@ -20,7 +20,7 @@ LOG_MODULE_REGISTER(ble_m, LOG_LEVEL_INF);
 
 // --- definitions -------------------------------------------------------------
 #ifndef DEVICE_NAME
-#define DEVICE_NAME     "nRF Audio Receiver"
+#define DEVICE_NAME     "LE-Audio Receiver"
 #define DEVICE_NAME_LEN (sizeof(DEVICE_NAME) - 1)
 #endif
 
@@ -29,7 +29,7 @@ LOG_MODULE_REGISTER(ble_m, LOG_LEVEL_INF);
 static ssize_t
 read_manufacturer(struct bt_conn *conn, const struct bt_gatt_attr *attr, void *buf, uint16_t len, uint16_t offset)
 {
-    const char *manufacturer = "Samsung";
+    const char *manufacturer = "GP Electronics";
     return bt_gatt_attr_read(conn, attr, buf, len, offset, manufacturer, strlen(manufacturer));
 }
 
@@ -50,8 +50,6 @@ static void disconnected(struct bt_conn *conn, uint8_t reason);
 // --- static variables definitions --------------------------------------------
 static struct bt_conn *ble_connection;
 
-static K_SEM_DEFINE(sem_connected, 0U, 1U);
-static K_SEM_DEFINE(sem_disconnected, 0U, 1U);
 struct bt_le_ext_adv *adv;
 
 static uint8_t unicast_server_addata[] = {
@@ -80,9 +78,7 @@ static void
 connected(struct bt_conn *conn, uint8_t err)
 {
     char addr[BT_ADDR_LE_STR_LEN];
-
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
     if (err != 0U)
     {
         LOG_ERR("Failed to connect to %s (err %u)", addr, err);
@@ -92,14 +88,12 @@ connected(struct bt_conn *conn, uint8_t err)
 
     LOG_INF("Connected: %s", addr);
     ble_connection = bt_conn_ref(conn);
-    k_sem_give(&sem_connected);
 }
 
 static void
 disconnected(struct bt_conn *conn, uint8_t reason)
 {
     char addr[BT_ADDR_LE_STR_LEN];
-
     if (conn != ble_connection)
     {
         return;
@@ -109,7 +103,6 @@ disconnected(struct bt_conn *conn, uint8_t reason)
     LOG_INF("Disconnected: %s (reason 0x%02x)", addr, reason);
     bt_conn_unref(ble_connection);
     ble_connection = NULL;
-    k_sem_give(&sem_disconnected);
 }
 
 void
@@ -151,20 +144,8 @@ ble_conn_control_start(void)
     }
 
     LOG_INF("BLE initialized successfully");
-
     ble_bap_unicast_server_start();
 
     k_sem_give(&ble_init_ok);
-
-    for (;;)
-    {
-        start_adv();
-        // Fix this 
-        error = k_sem_take(&sem_disconnected, K_FOREVER);
-        if (error != 0)
-        {
-            printk("failed to take sem_disconnected (err %d)\n", error);
-            return;
-        }
-    }
+    start_adv();
 }
