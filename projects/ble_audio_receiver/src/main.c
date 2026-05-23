@@ -7,20 +7,19 @@
 // --- logging settings --------------------------------------------------------
 LOG_MODULE_REGISTER(main_m);
 
-// --- static functions declarations -------------------------------------------
-
-// --- static variables definitions --------------------------------------------
-
-// --- structs -----------------------------------------------------------------
-
-// --- static functions definitions --------------------------------------------
-
-// --- functions definitions ---------------------------------------------------
+// --- main execution entry point ----------------------------------------------
 int
 main(void)
 {
+    // Initializes stack and starts background advertising
     ble_conn_control_start();
-    // TODO: At this point main is already blocked by ble_conn_control_start.
-    // I need to set up a new thread for that.
+    LOG_INF("Main application execution environment loaded cleanly");
+
+    while (1)
+    {
+        // Keep the main thread alive inside a low-power kernel sleep state
+        k_sleep(K_FOREVER);
+    }
+
     return 0;
 }
