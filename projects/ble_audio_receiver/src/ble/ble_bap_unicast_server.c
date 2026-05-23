@@ -311,7 +311,8 @@ stream_recv_lc3_codec(struct bt_bap_stream *stream, const struct bt_iso_recv_inf
     const int      octets_per_frame = buf->len / frames_per_sdu[idx];
     int            offset           = 0;
 
-    LOG_INF("ISO Recv [%d]: ts=%u, seq_num=%u, flags=0x%02x", idx, info->ts, info->seq_num, info->flags);
+    // Keep commented out. Enable only for debug
+    // LOG_INF("ISO Recv [%d]: ts=%u, seq_num=%u, flags=0x%02x", idx, info->ts, info->seq_num, info->flags);
 
     for (int i = 0; i < frames_per_sdu[idx]; i++)
     {
