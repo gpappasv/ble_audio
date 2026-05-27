@@ -316,6 +316,12 @@ static struct bt_bap_stream_ops stream_ops = {
 };
 
 // --- Core Public Interface ---------------------------------------------------
+struct bt_bap_stream *
+ble_bap_unicast_server_fetch_streams(void)
+{
+    return sink_streams;
+}
+
 void
 ble_bap_unicast_server_start(void)
 {

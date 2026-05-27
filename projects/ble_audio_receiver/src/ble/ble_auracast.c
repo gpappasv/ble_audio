@@ -1,6 +1,6 @@
 // --- includes ----------------------------------------------------------------
 #include "ble_auracast.h"
-
+#include "ble_bap_unicast_server.h"
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -13,30 +13,66 @@
 // --- logging settings --------------------------------------------------------
 LOG_MODULE_REGISTER(ble_auracast, LOG_LEVEL_INF);
 
-// --- defines -----------------------------------------------------------------
-#define MAX_SAMPLE_RATE            48000
-#define MAX_FRAME_DURATION_US      10000
-#define MAX_NUM_SAMPLES            ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
-#define BROADCAST_SNK_STREAM_COUNT 2 // Local definition bypasses Kconfig cache drift
+// --- Defines -----------------------------------------------------------------
+#define BROADCAST_SNK_STREAM_COUNT 2
+
+#ifndef CONFIG_BT_BAP_BASS_MAX_SUBGROUPS
+#define CONFIG_BT_BAP_BASS_MAX_SUBGROUPS 1
+#endif
+#define PA_SYNC_SKIP                                5U
+#define PA_SYNC_INTERVAL_TO_TIMEOUT_RATIO           5U
+#define BT_GAP_MS_TO_PER_ADV_SYNC_TIMEOUT(_timeout) ((uint16_t)((_timeout) / 10U))
+#define BT_GAP_US_TO_PER_ADV_SYNC_TIMEOUT(_timeout) (BT_GAP_MS_TO_PER_ADV_SYNC_TIMEOUT((_timeout) / USEC_PER_MSEC))
+#define BT_GAP_PER_ADV_INTERVAL_TO_US(_interval)    ((uint32_t)((_interval) * 1250U))
 
 // --- static variables definitions --------------------------------------------
+static uint32_t                      target_broadcast_id;
+static uint32_t                      pending_bis_bitmask;
+static bool                          is_radio_syncable = false; // Tracks if BIGInfo arrived
+static uint8_t                       current_src_id;
+static struct bt_le_per_adv_sync    *pa_sync_instance;
 static struct bt_bap_broadcast_sink *bcast_sink;
-static struct bt_bap_stream          broadcast_streams[BROADCAST_SNK_STREAM_COUNT];
 
-// Caching parameters discovered over the air
-static uint32_t target_broadcast_id;
+extern struct bt_bap_stream *ble_bap_unicast_server_fetch_streams(void);
 
-// Isolated LC3 decoder instances for handling Auracast frames
-static int16_t               audio_buf[BROADCAST_SNK_STREAM_COUNT][MAX_NUM_SAMPLES];
-static lc3_decoder_t         lc3_decoders[BROADCAST_SNK_STREAM_COUNT];
-static lc3_decoder_mem_48k_t lc3_decoder_mems[BROADCAST_SNK_STREAM_COUNT];
-static int                   octets_per_frame[BROADCAST_SNK_STREAM_COUNT];
+static void
+execute_sink_sync(uint32_t phone_mask)
+{
+    if (bcast_sink == NULL)
+    {
+        LOG_ERR("Attempted to sync BIS channels but Sink instance is NULL!");
+        return;
+    }
 
-// --- forward declarations ----------------------------------------------------
-static void stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, struct net_buf *buf);
-static void stream_stopped(struct bt_bap_stream *stream, uint8_t reason);
-static void stream_started(struct bt_bap_stream *stream);
-static void scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf);
+    /* 1. Translate Phone's 0-based BASS mask to Zephyr's 1-based API mask */
+    uint32_t zephyr_api_mask = 0;
+    for (int i = 0; i < 32; i++)
+    {
+        if (phone_mask & BIT(i))
+        {
+            zephyr_api_mask |= BIT(i + 1);
+        }
+    }
+
+    LOG_INF("Executing Audio Sync | Phone Mask: 0x%08X -> Zephyr Mask: 0x%08X", phone_mask, zephyr_api_mask);
+
+    /* 2. Fetch the base pointer to the stream array from the audio module */
+    struct bt_bap_stream *raw_array_base = ble_bap_unicast_server_fetch_streams();
+
+    /* 3. Build the local array of pointers required by the Zephyr API signature */
+    struct bt_bap_stream *streams_to_sync[BROADCAST_SNK_STREAM_COUNT] = { NULL };
+    for (int i = 0; i < BROADCAST_SNK_STREAM_COUNT; i++)
+    {
+        streams_to_sync[i] = &raw_array_base[i];
+    }
+
+    /* 4. Command the controller to open the high-speed audio valves */
+    int err = bt_bap_broadcast_sink_sync(bcast_sink, zephyr_api_mask, streams_to_sync, NULL);
+    if (err != 0)
+    {
+        LOG_ERR("BIG synchronization failed (err %d)", err);
+    }
+}
 
 // --- Scan Delegator Callbacks ------------------------------------------------
 static int
@@ -45,36 +81,74 @@ pa_sync_req_cb(struct bt_conn                                *conn,
                bool                                           past_avail,
                uint16_t                                       pa_interval)
 {
-    LOG_INF("Broadcast Assistant (Phone) requested PA Synchronization (Interval: %u). Request Approved.", pa_interval);
+    LOG_INF("Phone requested PA Sync (PAST available: %d)", past_avail);
 
-    int err = bt_bap_scan_delegator_set_pa_state(recv_state->src_id, BT_BAP_PA_STATE_SYNCED);
+    target_broadcast_id = recv_state->broadcast_id;
+    current_src_id      = recv_state->src_id;
+    pending_bis_bitmask = 0;
+    is_radio_syncable   = false; // Reset hardware lock flag on new hunt
+
+    /* Handle PAST (0ms latency sync) if the phone supports it */
+    if (IS_ENABLED(CONFIG_BT_PER_ADV_SYNC_TRANSFER_RECEIVER) && past_avail)
+    {
+        struct bt_le_per_adv_sync_transfer_param past_param = { 0 };
+        past_param.skip                                     = PA_SYNC_SKIP;
+        past_param.timeout = (pa_interval == BT_BAP_PA_INTERVAL_UNKNOWN)
+                                 ? BT_GAP_PER_ADV_MAX_TIMEOUT
+                                 : CLAMP(BT_GAP_US_TO_PER_ADV_SYNC_TIMEOUT(BT_GAP_PER_ADV_INTERVAL_TO_US(pa_interval))
+                                             * PA_SYNC_INTERVAL_TO_TIMEOUT_RATIO,
+                                         BT_GAP_PER_ADV_MIN_TIMEOUT,
+                                         BT_GAP_PER_ADV_MAX_TIMEOUT);
+
+        int err = bt_le_per_adv_sync_transfer_subscribe(conn, &past_param);
+        if (err == 0)
+        {
+            LOG_INF("PAST subscription active. Bypassing manual scanner.");
+            bt_bap_scan_delegator_set_pa_state(recv_state->src_id, BT_BAP_PA_STATE_INFO_REQ);
+            return 0;
+        }
+        LOG_WRN("PAST subscription failed (err %d). Falling back to manual scanner.", err);
+    }
+
+    /* Fallback: Standard blind scanning */
+    struct bt_le_per_adv_sync_param sync_param = { 0 };
+    bt_addr_le_copy(&sync_param.addr, &recv_state->addr);
+    sync_param.options = BT_LE_PER_ADV_SYNC_OPT_NONE;
+    sync_param.timeout = 1500;
+
+    int err = bt_le_per_adv_sync_create(&sync_param, &pa_sync_instance);
     if (err != 0)
     {
-        LOG_ERR("Failed updating Scan Delegator PA state register (err %d)", err);
+        LOG_ERR("Failed scheduling radio scanner (err %d)", err);
+        return err;
     }
+
+    bt_bap_scan_delegator_set_pa_state(recv_state->src_id, BT_BAP_PA_STATE_INFO_REQ);
     return 0;
 }
 
 static int
 pa_sync_term_req_cb(struct bt_conn *conn, const struct bt_bap_scan_delegator_recv_state *recv_state)
 {
-    LOG_INF("Broadcast Assistant (Phone) requested PA Termination. Processing orderly cleanup...");
+    LOG_INF("Phone requested PA Termination. Running teardown...");
 
-    // 1. CLEAR AUDIO STREAMS FIRST: Explicitly notify the phone that all BIS channels are dropped (set to 0)
-    uint32_t bis_clear[1] = { 0 };
-    int      err          = bt_bap_scan_delegator_set_bis_sync_state(recv_state->src_id, bis_clear);
-    if (err != 0)
+    if (bcast_sink)
     {
-        LOG_WRN("Scan Delegator BIS channels already inactive or cleared (err %d)", err);
+        bt_bap_broadcast_sink_delete(bcast_sink);
+        bcast_sink = NULL;
+    }
+    if (pa_sync_instance)
+    {
+        bt_le_per_adv_sync_delete(pa_sync_instance);
+        pa_sync_instance = NULL;
     }
 
-    // 2. CLEAR METADATA SECOND: Reset the PA status to NOT_SYNCED
-    err = bt_bap_scan_delegator_set_pa_state(recv_state->src_id, BT_BAP_PA_STATE_NOT_SYNCED);
-    if (err != 0)
-    {
-        LOG_ERR("Failed resetting Scan Delegator PA state register to NOT_SYNCED (err %d)", err);
-    }
+    uint32_t bis_clear[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS] = { 0 };
+    bt_bap_scan_delegator_set_bis_sync_state(recv_state->src_id, bis_clear);
+    bt_bap_scan_delegator_set_pa_state(recv_state->src_id, BT_BAP_PA_STATE_NOT_SYNCED);
 
+    pending_bis_bitmask = 0;
+    is_radio_syncable   = false; // Clear flag on termination
     return 0;
 }
 
@@ -83,39 +157,43 @@ bis_sync_req_cb(struct bt_conn                                *conn,
                 const struct bt_bap_scan_delegator_recv_state *recv_state,
                 const uint32_t                                 bis_sync_req[])
 {
-    // If the PA is already down, bypass completely as no context exists
     if (recv_state->pa_sync_state == BT_BAP_PA_STATE_NOT_SYNCED)
     {
-        LOG_INF("BIS request ignored because PA metadata link is already down.");
         return 0;
     }
 
-#ifndef CONFIG_BT_BAP_BASS_MAX_SUBGROUPS
-#define CONFIG_BT_BAP_BASS_MAX_SUBGROUPS 1
-#endif
-
     uint32_t bis_synced[CONFIG_BT_BAP_BASS_MAX_SUBGROUPS];
-    for (int i = 0; i < CONFIG_BT_BAP_BASS_MAX_SUBGROUPS; i++)
-    {
-        bis_synced[i] = bis_sync_req[i];
-    }
+    bis_synced[0] = bis_sync_req[0];
 
     if (bis_synced[0] == 0)
     {
-        LOG_INF("Broadcast Assistant requested AUDIO PAUSE (Stream bitmask cleared).");
+        LOG_INF("Audio Pause Command received.");
+        pending_bis_bitmask = 0;
+        if (bcast_sink)
+        {
+            bt_bap_broadcast_sink_stop(bcast_sink);
+        }
     }
     else
     {
-        LOG_INF("Broadcast Assistant requested AUDIO PLAY / SYNC (Bitmask: 0x%08X).", bis_synced[0]);
+        if (bis_synced[0] == BT_BAP_BIS_SYNC_NO_PREF)
+        {
+            bis_synced[0] = 0x00000003; /* Default to stereo layout */
+        }
+
+        /* Two-Key Handshake: Check if both hardware lock and sink allocation are ready */
+        if (!is_radio_syncable || bcast_sink == NULL)
+        {
+            LOG_INF("Hardware not syncable yet. Deferring bitmask (0x%08X)...", bis_synced[0]);
+            pending_bis_bitmask = bis_synced[0];
+        }
+        else
+        {
+            execute_sink_sync(bis_synced[0]);
+        }
     }
 
-    // Pass whatever the phone wants (active streams OR 0 for pause) directly to the stack
-    int err = bt_bap_scan_delegator_set_bis_sync_state(recv_state->src_id, bis_synced);
-    if (err != 0)
-    {
-        LOG_ERR("Failed updating Scan Delegator BIS state registers (err %d)", err);
-    }
-
+    bt_bap_scan_delegator_set_bis_sync_state(recv_state->src_id, bis_synced);
     return 0;
 }
 
@@ -125,193 +203,69 @@ static struct bt_bap_scan_delegator_cb delegator_cbs = {
     .pa_sync_term_req = pa_sync_term_req_cb,
 };
 
-// --- Real-Time Broadcast Audio Stream Ops ------------------------------------
-static struct bt_bap_stream_ops stream_ops = {
-    .recv    = stream_recv,
-    .stopped = stream_stopped,
-    .started = stream_started,
-};
-
-static void
-stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, struct net_buf *buf)
-{
-    int idx = -1;
-    for (int i = 0; i < ARRAY_SIZE(broadcast_streams); i++)
-    {
-        if (stream == &broadcast_streams[i])
-        {
-            idx = i;
-            break;
-        }
-    }
-
-    if (idx < 0 || lc3_decoders[idx] == NULL || info == NULL || buf == NULL)
-    {
-        return;
-    }
-
-    if (buf->len < octets_per_frame[idx])
-    {
-        return;
-    }
-
-    const uint8_t *in_buf = (info->flags & BT_ISO_FLAGS_VALID) ? buf->data : NULL;
-    int err = lc3_decode(lc3_decoders[idx], in_buf, octets_per_frame[idx], LC3_PCM_FORMAT_S16, audio_buf[idx], 1);
-    if (err < 0)
-    {
-        LOG_WRN("Auracast Decoder [%d] processing failure", idx);
-    }
-}
-
-static void
-stream_started(struct bt_bap_stream *stream)
-{
-    LOG_INF("Auracast Broadcast Isochronous Stream active: %p", stream);
-}
-
-static void
-stream_stopped(struct bt_bap_stream *stream, uint8_t reason)
-{
-    LOG_INF("Auracast Broadcast Isochronous Stream stopped: %p (reason 0x%02X)", stream, reason);
-}
-
 // --- BAP Broadcast Sink Global Callbacks -------------------------------------
 static void
 base_recv_cb(struct bt_bap_broadcast_sink *sink, const struct bt_bap_base *base, size_t base_size)
 {
-    LOG_INF("Broadcast Audio Source Endpoint (BASE) structural data block parsed successfully");
+    LOG_INF("BASE Blueprint packet received.");
+    /* No execution here to avoid err -11 (-EAGAIN). We wait for the BIGInfo structure. */
 }
 
 static void
-sink_syncable_cb(struct bt_bap_broadcast_sink *sink, const struct bt_iso_biginfo *biginfo)
+syncable_cb(struct bt_bap_broadcast_sink *sink, const struct bt_iso_biginfo *biginfo)
 {
-    int      err;
-    uint32_t bis_index_bitmask = 0;
-    // Create an array of pointers to satisfy the Zephyr API signature
-    struct bt_bap_stream *streams_to_sync[BROADCAST_SNK_STREAM_COUNT] = { NULL };
+    LOG_INF("BIG Metadata parsed. Hardware is officially SYNCABLE! Channels available: %d", biginfo->num_bis);
 
-    LOG_INF("Auracast Source Broadcast Group found! Syncable channels available: %d", biginfo->num_bis);
+    is_radio_syncable = true; /* Turn Key 2 */
 
-    for (int i = 0; i < MIN(biginfo->num_bis, ARRAY_SIZE(broadcast_streams)); i++)
+    /* Execute deferred intent if the phone requested play earlier */
+    if (pending_bis_bitmask != 0)
     {
-        bis_index_bitmask |= BIT(i + 1);
-
-        int freq              = 48000;
-        int frame_duration_us = 10000;
-        octets_per_frame[i]   = 120;
-
-        lc3_decoders[i] = lc3_setup_decoder(frame_duration_us, freq, freq, &lc3_decoder_mems[i]);
-        bt_bap_stream_cb_register(&broadcast_streams[i], &stream_ops);
-
-        // Assign the address of our static stream to the pointer array
-        streams_to_sync[i] = &broadcast_streams[i];
-    }
-
-    // Pass the array of pointers (streams_to_sync) instead of the raw array of structs
-    err = bt_bap_broadcast_sink_sync(sink, bis_index_bitmask, streams_to_sync, NULL);
-    if (err != 0)
-    {
-        LOG_ERR("Failed instructing controller to sync with BIG (err %d)", err);
+        LOG_INF("Executing deferred audio sync from syncable_cb...");
+        execute_sink_sync(pending_bis_bitmask);
+        pending_bis_bitmask = 0;
     }
 }
 
 static struct bt_bap_broadcast_sink_cb sink_cbs = {
     .base_recv = base_recv_cb,
-    .syncable  = sink_syncable_cb,
+    .syncable  = syncable_cb,
 };
 
-// --- LE Scanner Callbacks ----------------------------------------------------
 static void
-pa_synced(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_info *info)
+pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_info *info)
 {
-    int err;
+    LOG_INF("🎯 Radio locked onto Periodic Advertising train!");
+    pa_sync_instance = sync;
 
-    LOG_INF("Periodic Advertising (PA) Synchronization locked successfully!");
-
-    // Bind using the globally cached broadcast identification value
-    err = bt_bap_broadcast_sink_create(sync, target_broadcast_id, &bcast_sink);
+    int err = bt_bap_broadcast_sink_create(sync, target_broadcast_id, &bcast_sink);
     if (err != 0)
     {
-        LOG_ERR("Failed mapping PA tracking node to Broadcast Sink (err %d)", err);
+        LOG_ERR("Failed creating Broadcast Sink instance (err %d)", err);
+        return;
     }
+
+    /* Inform phone the connection is solid */
+    bt_bap_scan_delegator_set_pa_state(current_src_id, BT_BAP_PA_STATE_SYNCED);
+}
+
+static void
+pa_terminated_cb(struct bt_le_per_adv_sync *sync, const struct bt_le_per_adv_sync_term_info *info)
+{
+    LOG_INF("Link Layer PA tracking terminated (Reason: 0x%02X)", info->reason);
+    pa_sync_instance = NULL;
 }
 
 static struct bt_le_per_adv_sync_cb pa_sync_callbacks = {
-    .synced = pa_synced,
-};
-
-static bool
-scan_parse_report(struct bt_data *data, void *user_data)
-{
-    const struct bt_le_scan_recv_info *info = user_data;
-    int                                err;
-
-    // Look for Broadcast Audio Announcement Service (UUID 0x1852)
-    if (data->type == BT_DATA_SVC_DATA16)
-    {
-        uint16_t service_uuid = data->data[0] | (data->data[1] << 8);
-        if (data->data_len >= 5 && service_uuid == BT_UUID_BROADCAST_AUDIO_VAL)
-        {
-
-            // Extract the 24-bit Broadcast ID payload safely via bit-shifting
-            target_broadcast_id = data->data[2] | (data->data[3] << 8) | (data->data[4] << 16);
-
-            LOG_INF("Found an active Auracast Transmitter (ID: 0x%06X)! Syncing...", target_broadcast_id);
-
-            bt_le_scan_stop();
-
-            struct bt_le_per_adv_sync_param sync_param = {
-                .skip    = 0,
-                .timeout = 1000,
-            };
-            bt_addr_le_copy(&sync_param.addr, info->addr);
-            sync_param.options = BT_LE_PER_ADV_SYNC_OPT_NONE;
-
-            struct bt_le_per_adv_sync *pa_sync_instance = NULL;
-            err                                         = bt_le_per_adv_sync_create(&sync_param, &pa_sync_instance);
-            if (err != 0)
-            {
-                LOG_ERR("Failed creating periodic tracker (err %d)", err);
-                bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
-            }
-            return false;
-        }
-    }
-    return true;
-}
-
-static void
-scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *buf)
-{
-    if (info->adv_props & BT_GAP_ADV_PROP_EXT_ADV)
-    {
-        bt_data_parse(buf, scan_parse_report, (void *)info);
-    }
-}
-
-static struct bt_le_scan_cb scan_callbacks = {
-    .recv = scan_recv,
+    .synced = pa_synced_cb,
+    .term   = pa_terminated_cb,
 };
 
 // --- Public Interface --------------------------------------------------------
 void
 ble_auracast_start(void)
 {
-    int err;
-
-    // Register our application core hook endpoints cleanly
-    bt_bap_broadcast_sink_register_cb(&sink_cbs);
     bt_le_per_adv_sync_cb_register(&pa_sync_callbacks);
-    bt_le_scan_cb_register(&scan_callbacks);
-
+    bt_bap_broadcast_sink_register_cb(&sink_cbs);
     bt_bap_scan_delegator_register_cb(&delegator_cbs);
-
-    err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
-    if (err != 0)
-    {
-        LOG_ERR("Failed initializing passive Auracast scan loop (err %d)", err);
-        return;
-    }
-
-    LOG_INF("Auracast background scanner launched successfully");
 }
