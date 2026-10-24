@@ -8,7 +8,7 @@ target_sources(app PRIVATE
     src/main.c
     src/ble/ble_conn_control.c
     src/ble/ble_bap_unicast_server.c
-    src/ble/ble_auracast.c
+    src/dac/audio_i2s.c
 )
 
 # Architectural Best Practice: Expose your source root globally.

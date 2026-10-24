@@ -1,6 +1,8 @@
 // --- includes ----------------------------------------------------------------
 #include "ble_bap_unicast_server.h"
 
+#include "../dac/audio_i2s.h"
+
 #include <zephyr/bluetooth/audio/bap.h>
 #include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 #include <zephyr/bluetooth/audio/pacs.h>
@@ -8,7 +10,7 @@
 #include "lc3.h"
 
 // --- logging settings --------------------------------------------------------
-LOG_MODULE_DECLARE(ble_m);
+LOG_MODULE_REGISTER(ble_unicast_server, LOG_LEVEL_INF);
 
 // --- defines -----------------------------------------------------------------
 #define MAX_SAMPLE_RATE       48000
@@ -17,12 +19,12 @@ LOG_MODULE_DECLARE(ble_m);
 
 static const struct bt_audio_codec_cap lc3_codec_cap = BT_AUDIO_CODEC_CAP_LC3(
     BT_AUDIO_CODEC_CAP_FREQ_48KHZ,
-    BT_AUDIO_CODEC_CAP_DURATION_7_5 | BT_AUDIO_CODEC_CAP_DURATION_10,
+    BT_AUDIO_CODEC_CAP_DURATION_10,
     BT_AUDIO_CODEC_CAP_CHAN_COUNT_SUPPORT(1), /* Consider changing to 2 in the future - when audio is audible */
     40u,
     120u,
     1u,
-    (BT_AUDIO_CONTEXT_TYPE_CONVERSATIONAL | BT_AUDIO_CONTEXT_TYPE_MEDIA));
+    (BT_AUDIO_CONTEXT_TYPE_MEDIA));
 
 static const struct bt_audio_codec_qos_pref qos_pref
     = BT_AUDIO_CODEC_QOS_PREF(true, BT_GAP_LE_PHY_2M, 0x02, 10, 10000, 60000, 10000, 60000);
@@ -158,14 +160,33 @@ lc3_disable(struct bt_bap_stream *stream, struct bt_bap_ascs_rsp *rsp)
 {
     return 0;
 }
+
+static void
+cleanup_stream_state(struct bt_bap_stream *stream)
+{
+    int idx = get_stream_idx(stream);
+    if (idx >= 0)
+    {
+        lc3_decoders[idx]     = NULL;
+        frames_per_sdu[idx]   = 0;
+        octets_per_frame[idx] = 0;
+        LOG_INF("Reset decoder context for stream index %d", idx);
+    }
+}
+
 static int
 lc3_stop(struct bt_bap_stream *stream, struct bt_bap_ascs_rsp *rsp)
 {
+    LOG_INF("ASE Stop requested: stream %p", stream);
+    cleanup_stream_state(stream);
     return 0;
 }
+
 static int
 lc3_release(struct bt_bap_stream *stream, struct bt_bap_ascs_rsp *rsp)
 {
+    LOG_INF("ASE Release requested: stream %p", stream);
+    cleanup_stream_state(stream);
     return 0;
 }
 
@@ -174,23 +195,21 @@ static void
 stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, struct net_buf *buf)
 {
     int idx = get_stream_idx(stream);
-    if (idx < 0 || lc3_decoders[idx] == NULL || info == NULL || buf == NULL)
+    if (idx != 0 || lc3_decoders[idx] == NULL || info == NULL)
     {
         return;
     }
 
-    // Explicit validation: ensure the network buffer has enough bytes to decode
-    if (buf->len < (octets_per_frame[idx] * frames_per_sdu[idx]))
-    {
-        return;
-    }
+    // Determine if we have a valid ISO payload or need to run PLC
+    bool valid = (buf != NULL) && (info->flags & BT_ISO_FLAGS_VALID)
+                 && (buf->len >= (octets_per_frame[idx] * frames_per_sdu[idx]));
 
-    const uint8_t *in_buf = (info->flags & BT_ISO_FLAGS_VALID) ? buf->data : NULL;
+    const uint8_t *in_buf = valid ? buf->data : NULL;
     int            offset = 0;
 
     for (int i = 0; i < frames_per_sdu[idx]; i++)
     {
-        // Use the explicitly cached configuration size rather than calculating from raw buffer len
+        // Passing NULL to in_buf invokes LC3 Packet Loss Concealment (PLC)
         int err = lc3_decode(lc3_decoders[idx],
                              in_buf ? (in_buf + offset) : NULL,
                              octets_per_frame[idx],
@@ -205,7 +224,18 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
 
         if (err < 0)
         {
-            LOG_WRN("Decoder [%d] math failure on frame step %d (Passed Size: %d)", idx, i, octets_per_frame[idx]);
+            LOG_WRN("Decoder [0] math failure on frame %d", i);
+        }
+        else
+        {
+            int    dur_ret     = bt_audio_codec_cfg_get_frame_dur(stream->codec_cfg);
+            int    dur_us      = bt_audio_codec_cfg_frame_dur_to_frame_dur_us(dur_ret);
+            int    freq_ret    = bt_audio_codec_cfg_get_freq(stream->codec_cfg);
+            int    freq_hz     = bt_audio_codec_cfg_freq_to_freq_hz(freq_ret);
+            size_t num_samples = (dur_us * freq_hz) / USEC_PER_SEC;
+
+            // Always write 10 ms of PCM data to prevent I2S pipeline starvation
+            audio_i2s_write_frame(audio_buf[0], num_samples);
         }
     }
 }
@@ -213,7 +243,9 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
 static void
 stream_stopped(struct bt_bap_stream *stream, uint8_t reason)
 {
-    LOG_INF("Audio Stream %p stopped: reason 0x%02X", stream, reason);
+    LOG_INF("Audio stream %p stopped (reason 0x%02X)", stream, reason);
+    cleanup_stream_state(stream);
+    audio_i2s_stop();
 }
 
 static void
