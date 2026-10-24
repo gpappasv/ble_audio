@@ -42,12 +42,7 @@ main(void)
 
     audio_i2s_init(48000);
 
-    // Initializes stack and starts background unicast advertising
     ble_conn_control_start();
-
-    // Starts background Auracast scanning and synchronization loops
-    // TODO: deactivate until audio streaming works
-    // ble_auracast_start();
 
     LOG_INF("Main application execution environment loaded cleanly");
 

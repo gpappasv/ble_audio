@@ -28,7 +28,6 @@ static bool                    has_stale_peer = false;
 
 static void start_adv(void);
 
-// ASCS General Announcement metadata (allows any paired or new phone to connect)
 static uint8_t unicast_server_addata[] = {
     BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL),
     BT_AUDIO_UNICAST_ANNOUNCEMENT_GENERAL,
@@ -121,9 +120,6 @@ connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    /* SMART CONNECT TAKEOVER:
-     * If a phone is already connected and a second phone connects, immediately
-     * evict the first phone's audio stream and disconnect the first phone. */
     if (active_conn != NULL && active_conn != conn)
     {
         char old_addr[BT_ADDR_LE_STR_LEN];
@@ -158,13 +154,8 @@ connected(struct bt_conn *conn, uint8_t err)
             bt_conn_unref(active_conn);
         }
         active_conn = bt_conn_ref(conn);
-
-        /* Re-enable connectable advertising in the 2nd peripheral slot for Smart Connect */
-        k_work_reschedule(&adv_work, K_MSEC(400));
     }
 
-    /* Delay L2 security request by 350 ms so the phone (Central) can initiate
-     * encryption or fresh SMP Pairing first without role-collision errors. */
     k_work_reschedule(&sec_work, K_MSEC(350));
 }
 
@@ -308,9 +299,6 @@ ble_conn_control_start(void)
 
     bt_conn_auth_info_cb_register(&auth_info_cb);
 
-    /* CRITICAL: settings_load() MUST be called immediately after bt_enable() and
-     * BEFORE ble_bap_unicast_server_start() so dynamic GATT registration of ASCS
-     * and VCS is permitted by Zephyr's GATT subsystem. */
     if (IS_ENABLED(CONFIG_BT_SETTINGS))
     {
         settings_load();

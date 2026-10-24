@@ -4,6 +4,7 @@
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/logging/log.h>
 #include <string.h>
+#include <math.h> // Ensure math.h is included at the top of audio_i2s.c if not already
 
 LOG_MODULE_REGISTER(audio_i2s, LOG_LEVEL_INF);
 
@@ -24,7 +25,7 @@ K_MEM_SLAB_DEFINE_STATIC(i2s_mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 static const struct device * const i2s_dev          = DEVICE_DT_GET(I2S_NODE);
 static bool                        tx_running       = false;
 static int                         buffered_count   = 0;
-static volatile int32_t            target_gain_q15  = 20000; /* Default ~78% initial volume */
+static volatile int32_t            target_gain_q15  = 20000;
 static int32_t                     current_gain_q15 = 20000;
 
 void
@@ -42,18 +43,25 @@ audio_i2s_set_volume(uint8_t volume, bool muted)
         return;
     }
 
-    /* Standard audio quadratic taper: G = (volume / 255)^2 * UNITY_GAIN_Q15
-     * Max value at v=254: 254 * 254 * 32768 = 2,114,064,384 (cleanly fits in uint32_t).
-     * Provides smooth, natural decibel progression across the entire slider with zero overflow. */
-    uint32_t v    = (uint32_t)volume;
-    uint32_t gain = (v * v * (uint32_t)UNITY_GAIN_Q15) / (255U * 255U);
+    /* Perceptual Decibel Mapping (-40 dB to 0 dB):
+     * Equal steps on the slider now produce equal decibel (logarithmic) changes
+     * in volume, fixing the 50% loudness cliff and smoothing out the low end. */
+    float fraction = (float)volume / 255.0f;
+    float db       = -40.0f * (1.0f - fraction);
+    float linear   = powf(10.0f, db / 20.0f);
+
+    int32_t gain = (int32_t)(linear * (float)UNITY_GAIN_Q15 + 0.5f);
 
     if (gain == 0U)
     {
         gain = 1U;
     }
+    else if (gain > UNITY_GAIN_Q15)
+    {
+        gain = UNITY_GAIN_Q15;
+    }
 
-    target_gain_q15 = (int32_t)gain;
+    target_gain_q15 = gain;
 }
 
 int
@@ -86,7 +94,7 @@ audio_i2s_init(uint32_t sample_rate_hz)
     tx_running     = false;
     buffered_count = 0;
 
-    LOG_INF("I2S initialized in READY state (%u Hz)", sample_rate_hz);
+    LOG_INF("I2S initialized in READY state (%u Hz, 16-bit stereo)", sample_rate_hz);
     return 0;
 }
 
@@ -107,7 +115,6 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
         return -EINVAL;
     }
 
-    /* High-watermark guard: prevent slab exhaustion if phone clock is slightly faster */
     uint32_t used_blocks = k_mem_slab_num_used_get(&i2s_mem_slab);
     if (tx_running && used_blocks >= HIGH_WATERMARK_DROP)
     {
@@ -127,7 +134,6 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
 
     for (size_t i = 0; i < num_samples; i++)
     {
-        /* Smooth gain stepping per sample to eliminate zipper noise during volume adjustment */
         if (cur_gain < tgt_gain)
         {
             cur_gain += 32;
@@ -145,18 +151,34 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
             }
         }
 
-        /* Apply Q15 gain with symmetric rounding */
         int32_t l_scaled = ((int32_t)left_pcm[i] * cur_gain + 16384) >> 15;
         int32_t r_scaled = ((int32_t)right_pcm[i] * cur_gain + 16384) >> 15;
 
-        out[2 * i]     = (int16_t)l_scaled; /* Left channel  */
-        out[2 * i + 1] = (int16_t)r_scaled; /* Right channel */
+        out[2 * i]     = (int16_t)l_scaled;
+        out[2 * i + 1] = (int16_t)r_scaled;
     }
 
     current_gain_q15 = cur_gain;
 
     size_t payload_bytes = num_samples * CHANNELS * BYTES_PER_SAMPLE;
-    err                  = i2s_write(i2s_dev, tx_buf, payload_bytes);
+
+    /* Emergency last-block guard: in normal operation used_blocks sits at 5..6.
+     * If a severe RF drop ever drains the queue down to the final block (<= 1),
+     * duplicate the current frame so EasyDMA never hits hardware starvation (-EIO). */
+    if (tx_running && used_blocks <= 1U)
+    {
+        void *pad_buf = NULL;
+        if (k_mem_slab_alloc(&i2s_mem_slab, &pad_buf, K_NO_WAIT) == 0)
+        {
+            memcpy(pad_buf, tx_buf, payload_bytes);
+            if (i2s_write(i2s_dev, pad_buf, payload_bytes) != 0)
+            {
+                k_mem_slab_free(&i2s_mem_slab, pad_buf);
+            }
+        }
+    }
+
+    err = i2s_write(i2s_dev, tx_buf, payload_bytes);
 
     if (err == -EIO)
     {
