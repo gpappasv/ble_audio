@@ -3,6 +3,7 @@
 
 // --- includes ----------------------------------------------------------------
 #include <zephyr/bluetooth/audio/audio.h>
+#include <zephyr/bluetooth/conn.h>
 
 // --- defines -----------------------------------------------------------------
 #define AVAILABLE_SINK_CONTEXT                                                                              \
@@ -14,7 +15,7 @@
      | BT_AUDIO_CONTEXT_TYPE_GAME)
 
 // --- functions declarations --------------------------------------------------
-struct bt_bap_stream *ble_bap_unicast_server_fetch_streams(void);
-void                  ble_bap_unicast_server_start(void);
+void ble_bap_unicast_server_start(void);
+void ble_bap_unicast_server_evict_conn(struct bt_conn *conn);
 
 #endif // BLE_BAP_UNICAST_SERVER_H

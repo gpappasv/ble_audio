@@ -15,16 +15,47 @@ LOG_MODULE_REGISTER(audio_i2s, LOG_LEVEL_INF);
 #define BLOCK_SIZE            (SAMPLES_PER_FRAME_MAX * CHANNELS * BYTES_PER_SAMPLE)
 #define BLOCK_COUNT           16
 
-/* 6 frames (60 ms) prebuffer inside the 16-block queue gives deep jitter
- * immunity without ever touching the low/high boundaries in normal operation. */
 #define PREBUFFER_FRAMES    6
 #define HIGH_WATERMARK_DROP 14
+#define UNITY_GAIN_Q15      32768
 
 K_MEM_SLAB_DEFINE_STATIC(i2s_mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 
-static const struct device * const i2s_dev        = DEVICE_DT_GET(I2S_NODE);
-static bool                        tx_running     = false;
-static int                         buffered_count = 0;
+static const struct device * const i2s_dev          = DEVICE_DT_GET(I2S_NODE);
+static bool                        tx_running       = false;
+static int                         buffered_count   = 0;
+static volatile int32_t            target_gain_q15  = 20000; /* Default ~85% volume */
+static int32_t                     current_gain_q15 = 20000;
+
+void
+audio_i2s_set_volume(uint8_t volume, bool muted)
+{
+    if (muted || volume == 0U)
+    {
+        target_gain_q15 = 0;
+        return;
+    }
+
+    if (volume >= 255U)
+    {
+        target_gain_q15 = UNITY_GAIN_Q15;
+        return;
+    }
+
+    /* Perceptual cubic audio taper: G = (volume / 255)^3 in Q15 (0..32768).
+     * Gives natural logarithmic loudness across the entire Android slider. */
+    uint32_t v     = (uint32_t)volume;
+    uint32_t v_cub = v * v * v;
+    int32_t  q15   = (int32_t)((v_cub * (uint32_t)UNITY_GAIN_Q15) / (255UL * 255UL * 255UL));
+
+    /* Guarantee non-zero audibility at very low non-zero steps (volume 1..15) */
+    if (q15 < 16)
+    {
+        q15 = (int32_t)v;
+    }
+
+    target_gain_q15 = q15;
+}
 
 int
 audio_i2s_init(uint32_t sample_rate_hz)
@@ -91,18 +122,43 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
         return -ENOBUFS;
     }
 
-    int16_t *out = (int16_t *)tx_buf;
+    int32_t  tgt_gain = target_gain_q15;
+    int32_t  cur_gain = current_gain_q15;
+    int16_t *out      = (int16_t *)tx_buf;
+
     for (size_t i = 0; i < num_samples; i++)
     {
-        out[2 * i]     = left_pcm[i];  /* Left channel  */
-        out[2 * i + 1] = right_pcm[i]; /* Right channel */
+        /* Smoothly step gain toward target to prevent zipper clicks on volume changes */
+        if (cur_gain < tgt_gain)
+        {
+            cur_gain += 64;
+            if (cur_gain > tgt_gain)
+            {
+                cur_gain = tgt_gain;
+            }
+        }
+        else if (cur_gain > tgt_gain)
+        {
+            cur_gain -= 64;
+            if (cur_gain < tgt_gain)
+            {
+                cur_gain = tgt_gain;
+            }
+        }
+
+        /* Apply Q15 gain with symmetric rounding */
+        int32_t l_scaled = ((int32_t)left_pcm[i] * cur_gain + 16384) >> 15;
+        int32_t r_scaled = ((int32_t)right_pcm[i] * cur_gain + 16384) >> 15;
+
+        out[2 * i]     = (int16_t)l_scaled; /* Left channel  */
+        out[2 * i + 1] = (int16_t)r_scaled; /* Right channel */
     }
+
+    current_gain_q15 = cur_gain;
 
     size_t payload_bytes = num_samples * CHANNELS * BYTES_PER_SAMPLE;
     err                  = i2s_write(i2s_dev, tx_buf, payload_bytes);
 
-    /* If an extreme RF dropout ever starved the 6-frame cushion, reset cleanly
-     * and wait for a full 6-frame prebuffer before restarting DMA. */
     if (err == -EIO)
     {
         LOG_WRN("I2S queue starved; re-buffering %d frames", PREBUFFER_FRAMES);
@@ -134,10 +190,4 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
     }
 
     return 0;
-}
-
-int
-audio_i2s_write_frame(const int16_t *mono_pcm, size_t num_samples)
-{
-    return audio_i2s_write_stereo_frame(mono_pcm, mono_pcm, num_samples);
 }
