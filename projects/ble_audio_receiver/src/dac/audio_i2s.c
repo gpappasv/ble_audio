@@ -24,7 +24,7 @@ K_MEM_SLAB_DEFINE_STATIC(i2s_mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 static const struct device * const i2s_dev          = DEVICE_DT_GET(I2S_NODE);
 static bool                        tx_running       = false;
 static int                         buffered_count   = 0;
-static volatile int32_t            target_gain_q15  = 20000; /* Default ~85% volume */
+static volatile int32_t            target_gain_q15  = 20000; /* Default ~78% initial volume */
 static int32_t                     current_gain_q15 = 20000;
 
 void
@@ -42,19 +42,18 @@ audio_i2s_set_volume(uint8_t volume, bool muted)
         return;
     }
 
-    /* Perceptual cubic audio taper: G = (volume / 255)^3 in Q15 (0..32768).
-     * Gives natural logarithmic loudness across the entire Android slider. */
-    uint32_t v     = (uint32_t)volume;
-    uint32_t v_cub = v * v * v;
-    int32_t  q15   = (int32_t)((v_cub * (uint32_t)UNITY_GAIN_Q15) / (255UL * 255UL * 255UL));
+    /* Standard audio quadratic taper: G = (volume / 255)^2 * UNITY_GAIN_Q15
+     * Max value at v=254: 254 * 254 * 32768 = 2,114,064,384 (cleanly fits in uint32_t).
+     * Provides smooth, natural decibel progression across the entire slider with zero overflow. */
+    uint32_t v    = (uint32_t)volume;
+    uint32_t gain = (v * v * (uint32_t)UNITY_GAIN_Q15) / (255U * 255U);
 
-    /* Guarantee non-zero audibility at very low non-zero steps (volume 1..15) */
-    if (q15 < 16)
+    if (gain == 0U)
     {
-        q15 = (int32_t)v;
+        gain = 1U;
     }
 
-    target_gain_q15 = q15;
+    target_gain_q15 = (int32_t)gain;
 }
 
 int
@@ -128,10 +127,10 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
 
     for (size_t i = 0; i < num_samples; i++)
     {
-        /* Smoothly step gain toward target to prevent zipper clicks on volume changes */
+        /* Smooth gain stepping per sample to eliminate zipper noise during volume adjustment */
         if (cur_gain < tgt_gain)
         {
-            cur_gain += 64;
+            cur_gain += 32;
             if (cur_gain > tgt_gain)
             {
                 cur_gain = tgt_gain;
@@ -139,7 +138,7 @@ audio_i2s_write_stereo_frame(const int16_t *left_pcm, const int16_t *right_pcm, 
         }
         else if (cur_gain > tgt_gain)
         {
-            cur_gain -= 64;
+            cur_gain -= 32;
             if (cur_gain < tgt_gain)
             {
                 cur_gain = tgt_gain;
