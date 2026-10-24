@@ -8,6 +8,7 @@
 #include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 #include <zephyr/bluetooth/audio/pacs.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/sys/util.h>
 #include <string.h>
 #include "lc3.h"
 
@@ -18,7 +19,8 @@ LOG_MODULE_REGISTER(ble_unicast_server, LOG_LEVEL_INF);
 #define MAX_SAMPLE_RATE       48000
 #define MAX_FRAME_DURATION_US 10000
 #define MAX_NUM_SAMPLES       ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
-#define MAX_SDU_BUF_SIZE      240
+#define MAX_AUDIO_CHANNELS    2
+#define MAX_SDU_BUF_SIZE      248
 
 #define AUDIO_WORKER_STACK_SIZE 4096
 #define AUDIO_WORKER_PRIORITY   K_PRIO_PREEMPT(2)
@@ -31,15 +33,17 @@ struct lc3_sdu_packet
     uint8_t  data[MAX_SDU_BUF_SIZE];
 };
 
-K_MSGQ_DEFINE(lc3_rx_msgq, sizeof(struct lc3_sdu_packet), 12, 4);
+K_MSGQ_DEFINE(lc3_rx_msgq, sizeof(struct lc3_sdu_packet), 16, 4);
 
-static const struct bt_audio_codec_cap lc3_codec_cap = BT_AUDIO_CODEC_CAP_LC3(BT_AUDIO_CODEC_CAP_FREQ_48KHZ,
-                                                                              BT_AUDIO_CODEC_CAP_DURATION_10,
-                                                                              BT_AUDIO_CODEC_CAP_CHAN_COUNT_SUPPORT(1),
-                                                                              40u,
-                                                                              155u,
-                                                                              1u,
-                                                                              (BT_AUDIO_CONTEXT_TYPE_MEDIA));
+/* Advertise support for both 1 and 2 channels per CIS, up to 2 frames per SDU */
+static const struct bt_audio_codec_cap lc3_codec_cap = BT_AUDIO_CODEC_CAP_LC3(
+    BT_AUDIO_CODEC_CAP_FREQ_48KHZ,
+    BT_AUDIO_CODEC_CAP_DURATION_10,
+    BT_AUDIO_CODEC_CAP_CHAN_COUNT_SUPPORT(1, 2),
+    40u,
+    120u,
+    2u,
+    (BT_AUDIO_CONTEXT_TYPE_MEDIA | BT_AUDIO_CONTEXT_TYPE_CONVERSATIONAL | BT_AUDIO_CONTEXT_TYPE_GAME));
 
 static const struct bt_audio_codec_qos_pref qos_pref
     = BT_AUDIO_CODEC_QOS_PREF(true, BT_GAP_LE_PHY_2M, 0x02, 10, 10000, 60000, 10000, 60000);
@@ -54,24 +58,44 @@ static struct bt_pacs_cap cap_sink = {
     .codec_cap = &lc3_codec_cap,
 };
 
-// Isolated state tracking per active stream channel
-static int16_t               audio_buf[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT][MAX_NUM_SAMPLES];
-static lc3_decoder_t         lc3_decoders[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
-static lc3_decoder_mem_48k_t lc3_decoder_mems[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
-static int                   frames_per_sdu[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
-static int                   octets_per_frame[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
-static size_t                samples_per_frame[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+// Decoder instances indexed by physical audio channel: [0] = Left, [1] = Right
+static lc3_decoder_t         lc3_decoders[MAX_AUDIO_CHANNELS];
+static lc3_decoder_mem_48k_t lc3_decoder_mems[MAX_AUDIO_CHANNELS];
+static int16_t               pcm_left_buf[MAX_NUM_SAMPLES];
+static int16_t               pcm_right_buf[MAX_NUM_SAMPLES];
+static bool                  left_staged  = false;
+static bool                  right_staged = false;
 
-// Sequence continuity tracking for stream 0
-static uint16_t expected_seq_num = 0;
-static bool     seq_initialized  = false;
+// Per-ASE stream configuration state
+static bool     stream_active[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static int      frames_per_sdu[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static int      octets_per_frame[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static int      chan_cnt_per_stream[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static bool     is_right_stream[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static size_t   samples_per_frame[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static uint16_t expected_seq_num[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
+static bool     seq_initialized[CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT];
 
 // --- forward declarations ----------------------------------------------------
 static int                   get_stream_idx(struct bt_bap_stream *stream);
 static struct bt_bap_stream *stream_alloc(enum bt_audio_dir dir);
 static enum bt_audio_dir     stream_dir(const struct bt_bap_stream *stream);
 
-// --- Dedicated Audio Decode & I2S Worker Thread ------------------------------
+static int
+count_active_streams(void)
+{
+    int cnt = 0;
+    for (int i = 0; i < CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT; i++)
+    {
+        if (stream_active[i])
+        {
+            cnt++;
+        }
+    }
+    return cnt;
+}
+
+// --- Dedicated Audio Decode & Stereo Pairing Worker Thread -------------------
 static void
 lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
 {
@@ -89,16 +113,17 @@ lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
         }
 
         uint8_t idx = pkt.stream_idx;
-        if (idx >= CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT || lc3_decoders[idx] == NULL)
+        if (idx >= CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT || !stream_active[idx])
         {
             continue;
         }
 
-        int    f_per_sdu = frames_per_sdu[idx];
+        int    f_blocks  = frames_per_sdu[idx];
         int    octets    = octets_per_frame[idx];
+        int    chans     = chan_cnt_per_stream[idx];
         size_t n_samples = samples_per_frame[idx];
 
-        if (f_per_sdu <= 0 || octets <= 0 || n_samples == 0)
+        if (f_blocks <= 0 || octets <= 0 || n_samples == 0)
         {
             continue;
         }
@@ -106,23 +131,101 @@ lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
         const uint8_t *in_buf = pkt.valid ? pkt.data : NULL;
         int            offset = 0;
 
-        for (int i = 0; i < f_per_sdu; i++)
+        /* CASE 1: Single-CIS Multiplexed Stereo (2 channels packed in 1 SDU) */
+        if (chans == 2 && lc3_decoders[0] != NULL && lc3_decoders[1] != NULL)
         {
-            int err = lc3_decode(
-                lc3_decoders[idx], in_buf ? (in_buf + offset) : NULL, octets, LC3_PCM_FORMAT_S16, audio_buf[idx], 1);
-
-            if (in_buf)
+            for (int b = 0; b < f_blocks; b++)
             {
+                const uint8_t *l_ptr = in_buf ? (in_buf + offset) : NULL;
+                const uint8_t *r_ptr = in_buf ? (in_buf + offset + octets) : NULL;
+                offset += (2 * octets);
+
+                if (lc3_decode(lc3_decoders[0], l_ptr, octets, LC3_PCM_FORMAT_S16, pcm_left_buf, 1) < 0)
+                {
+                    memset(pcm_left_buf, 0, n_samples * sizeof(int16_t));
+                }
+                if (lc3_decode(lc3_decoders[1], r_ptr, octets, LC3_PCM_FORMAT_S16, pcm_right_buf, 1) < 0)
+                {
+                    memset(pcm_right_buf, 0, n_samples * sizeof(int16_t));
+                }
+
+                audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+            }
+            continue;
+        }
+
+        /* CASE 2: Dual-CIS Split Stereo (2 separate ASEs active, 1 channel each) */
+        if (count_active_streams() >= 2 && lc3_decoders[0] != NULL && lc3_decoders[1] != NULL)
+        {
+            bool right_ch = is_right_stream[idx];
+
+            for (int b = 0; b < f_blocks; b++)
+            {
+                const uint8_t *frame_ptr = in_buf ? (in_buf + offset) : NULL;
                 offset += octets;
-            }
 
-            if (err < 0)
+                if (!right_ch)
+                {
+                    /* If previous Left wasn't paired yet (Right dropped), conceal Right and flush */
+                    if (left_staged)
+                    {
+                        lc3_decode(lc3_decoders[1], NULL, octets, LC3_PCM_FORMAT_S16, pcm_right_buf, 1);
+                        audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                        left_staged  = false;
+                        right_staged = false;
+                    }
+
+                    if (lc3_decode(lc3_decoders[0], frame_ptr, octets, LC3_PCM_FORMAT_S16, pcm_left_buf, 1) < 0)
+                    {
+                        memset(pcm_left_buf, 0, n_samples * sizeof(int16_t));
+                    }
+                    left_staged = true;
+                }
+                else
+                {
+                    /* If previous Right wasn't paired yet (Left dropped), conceal Left and flush */
+                    if (right_staged)
+                    {
+                        lc3_decode(lc3_decoders[0], NULL, octets, LC3_PCM_FORMAT_S16, pcm_left_buf, 1);
+                        audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                        left_staged  = false;
+                        right_staged = false;
+                    }
+
+                    if (lc3_decode(lc3_decoders[1], frame_ptr, octets, LC3_PCM_FORMAT_S16, pcm_right_buf, 1) < 0)
+                    {
+                        memset(pcm_right_buf, 0, n_samples * sizeof(int16_t));
+                    }
+                    right_staged = true;
+                }
+
+                /* Both Left and Right decoded for this interval -> output interleaved stereo */
+                if (left_staged && right_staged)
+                {
+                    audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                    left_staged  = false;
+                    right_staged = false;
+                }
+            }
+            continue;
+        }
+
+        /* CASE 3: Single-Stream Mono Fallback */
+        int dec_idx = is_right_stream[idx] ? 1 : 0;
+        if (lc3_decoders[dec_idx] != NULL)
+        {
+            for (int b = 0; b < f_blocks; b++)
             {
-                LOG_WRN("Decoder [%u] math failure on frame %d", idx, i);
-                memset(audio_buf[idx], 0, n_samples * sizeof(int16_t));
-            }
+                const uint8_t *frame_ptr = in_buf ? (in_buf + offset) : NULL;
+                offset += octets;
 
-            audio_i2s_write_frame(audio_buf[idx], n_samples);
+                if (lc3_decode(lc3_decoders[dec_idx], frame_ptr, octets, LC3_PCM_FORMAT_S16, pcm_left_buf, 1) < 0)
+                {
+                    memset(pcm_left_buf, 0, n_samples * sizeof(int16_t));
+                }
+
+                audio_i2s_write_stereo_frame(pcm_left_buf, pcm_left_buf, n_samples);
+            }
         }
     }
 }
@@ -148,13 +251,14 @@ lc3_config(struct bt_conn                        *conn,
         return -ENOMEM;
     }
 
-    LOG_INF("ASE Configured: stream %p", *stream);
+    int idx = get_stream_idx(*stream);
+    LOG_INF("ASE Configured: stream %p (idx %d)", *stream, idx);
     *pref = qos_pref;
 
-    int idx = get_stream_idx(*stream);
     if (idx >= 0)
     {
-        lc3_decoders[idx] = NULL;
+        stream_active[idx]   = false;
+        seq_initialized[idx] = false;
     }
 
     return 0;
@@ -201,6 +305,23 @@ lc3_enable(struct bt_bap_stream *stream, const uint8_t meta[], size_t meta_len, 
     int freq              = bt_audio_codec_cfg_freq_to_freq_hz(freq_ret);
     int frame_duration_us = bt_audio_codec_cfg_frame_dur_to_frame_dur_us(dur_ret);
 
+    enum bt_audio_location chan_alloc = BT_AUDIO_LOCATION_MONO_AUDIO;
+    bt_audio_codec_cfg_get_chan_allocation(stream->codec_cfg, &chan_alloc, true);
+
+    bool has_left  = (chan_alloc & BT_AUDIO_LOCATION_FRONT_LEFT) != 0;
+    bool has_right = (chan_alloc & BT_AUDIO_LOCATION_FRONT_RIGHT) != 0;
+
+    if (has_left && has_right)
+    {
+        chan_cnt_per_stream[idx] = 2;
+        is_right_stream[idx]     = false;
+    }
+    else
+    {
+        chan_cnt_per_stream[idx] = 1;
+        is_right_stream[idx]     = has_right ? true : (has_left ? false : (idx == 1));
+    }
+
     int blocks             = bt_audio_codec_cfg_get_frame_blocks_per_sdu(stream->codec_cfg, true);
     frames_per_sdu[idx]    = (blocks > 0) ? blocks : 1;
     octets_per_frame[idx]  = len_ret;
@@ -211,24 +332,31 @@ lc3_enable(struct bt_bap_stream *stream, const uint8_t meta[], size_t meta_len, 
         samples_per_frame[idx] = MAX_NUM_SAMPLES;
     }
 
-    LOG_INF("Enable Stream [%d]: %d Hz, %d us, %d Octets/Frame, %d Frames/SDU (%u samples)",
+    /* Setup decoder context(s) required by this stream */
+    if (chan_cnt_per_stream[idx] == 2)
+    {
+        lc3_decoders[0] = lc3_setup_decoder(frame_duration_us, freq, freq, &lc3_decoder_mems[0]);
+        lc3_decoders[1] = lc3_setup_decoder(frame_duration_us, freq, freq, &lc3_decoder_mems[1]);
+    }
+    else
+    {
+        int dec_idx           = is_right_stream[idx] ? 1 : 0;
+        lc3_decoders[dec_idx] = lc3_setup_decoder(frame_duration_us, freq, freq, &lc3_decoder_mems[dec_idx]);
+    }
+
+    seq_initialized[idx] = false;
+    stream_active[idx]   = true;
+    left_staged          = false;
+    right_staged         = false;
+
+    LOG_INF("Enable Stream [%d]: %d Hz, %d us, %d Octets/Frame, %d Chans (alloc 0x%04X, %s)",
             idx,
             freq,
             frame_duration_us,
             octets_per_frame[idx],
-            frames_per_sdu[idx],
-            (unsigned int)samples_per_frame[idx]);
-
-    k_msgq_purge(&lc3_rx_msgq);
-    seq_initialized = false;
-
-    lc3_decoders[idx] = lc3_setup_decoder(frame_duration_us, freq, freq, &lc3_decoder_mems[idx]);
-    if (lc3_decoders[idx] == NULL)
-    {
-        LOG_ERR("Failed to instantiate context for decoder context instance %d", idx);
-        *rsp = BT_BAP_ASCS_RSP(BT_BAP_ASCS_RSP_CODE_CONF_INVALID, BT_BAP_ASCS_REASON_CODEC_DATA);
-        return -1;
-    }
+            chan_cnt_per_stream[idx],
+            (unsigned int)chan_alloc,
+            (chan_cnt_per_stream[idx] == 2) ? "STEREO-1CIS" : (is_right_stream[idx] ? "RIGHT" : "LEFT"));
 
     return 0;
 }
@@ -257,12 +385,21 @@ cleanup_stream_state(struct bt_bap_stream *stream)
     int idx = get_stream_idx(stream);
     if (idx >= 0)
     {
-        lc3_decoders[idx]      = NULL;
-        frames_per_sdu[idx]    = 0;
-        octets_per_frame[idx]  = 0;
-        samples_per_frame[idx] = 0;
-        seq_initialized        = false;
-        k_msgq_purge(&lc3_rx_msgq);
+        stream_active[idx]       = false;
+        frames_per_sdu[idx]      = 0;
+        octets_per_frame[idx]    = 0;
+        chan_cnt_per_stream[idx] = 0;
+        samples_per_frame[idx]   = 0;
+        seq_initialized[idx]     = false;
+
+        if (count_active_streams() == 0)
+        {
+            lc3_decoders[0] = NULL;
+            lc3_decoders[1] = NULL;
+            left_staged     = false;
+            right_staged    = false;
+            k_msgq_purge(&lc3_rx_msgq);
+        }
         LOG_INF("Reset decoder context for stream index %d", idx);
     }
 }
@@ -288,16 +425,15 @@ static void
 stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, struct net_buf *buf)
 {
     int idx = get_stream_idx(stream);
-    if (idx != 0 || lc3_decoders[idx] == NULL || info == NULL)
+    if (idx < 0 || idx >= CONFIG_BT_ASCS_MAX_ASE_SNK_COUNT || !stream_active[idx] || info == NULL)
     {
         return;
     }
 
-    /* 1. Detect skipped sequence numbers (when Controller misses an ISO event completely)
-     *    and enqueue PLC frames so the I2S buffer never loses its reserve. */
-    if (seq_initialized)
+    /* 1. Detect skipped sequence numbers per stream and enqueue PLC packets */
+    if (seq_initialized[idx])
     {
-        uint16_t gap = (uint16_t)(info->seq_num - expected_seq_num);
+        uint16_t gap = (uint16_t)(info->seq_num - expected_seq_num[idx]);
         if (gap > 0 && gap <= 4)
         {
             struct lc3_sdu_packet plc_pkt = {
@@ -311,13 +447,13 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
             }
         }
     }
-    expected_seq_num = (uint16_t)(info->seq_num + 1U);
-    seq_initialized  = true;
+    expected_seq_num[idx] = (uint16_t)(info->seq_num + 1U);
+    seq_initialized[idx]  = true;
 
-    /* 2. Package current SDU and push to worker queue without blocking BT RX thread */
-    size_t required_len = (size_t)(octets_per_frame[idx] * frames_per_sdu[idx]);
+    /* 2. Package SDU payload and push to worker queue without blocking BT RX thread */
+    size_t required_len = (size_t)(octets_per_frame[idx] * frames_per_sdu[idx] * chan_cnt_per_stream[idx]);
     bool   valid        = (buf != NULL) && ((info->flags & BT_ISO_FLAGS_VALID) != 0) && (buf->len >= required_len)
-                          && (required_len <= MAX_SDU_BUF_SIZE);
+                          && (required_len > 0) && (required_len <= MAX_SDU_BUF_SIZE);
 
     struct lc3_sdu_packet pkt;
     pkt.stream_idx = (uint8_t)idx;
@@ -341,14 +477,21 @@ stream_stopped(struct bt_bap_stream *stream, uint8_t reason)
 {
     LOG_INF("Audio stream %p stopped (reason 0x%02X)", stream, reason);
     cleanup_stream_state(stream);
-    audio_i2s_stop();
+    if (count_active_streams() == 0)
+    {
+        audio_i2s_stop();
+    }
 }
 
 static void
 stream_started(struct bt_bap_stream *stream)
 {
-    seq_initialized = false;
-    LOG_INF("Audio Stream %p streaming link active", stream);
+    int idx = get_stream_idx(stream);
+    if (idx >= 0)
+    {
+        seq_initialized[idx] = false;
+    }
+    LOG_INF("Audio Stream %p (idx %d) streaming link active", stream, idx);
 }
 
 static void
