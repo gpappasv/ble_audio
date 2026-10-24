@@ -14,13 +14,19 @@ LOG_MODULE_REGISTER(audio_i2s, LOG_LEVEL_INF);
 #define BYTES_PER_SAMPLE      sizeof(int16_t)
 #define BLOCK_SIZE            (SAMPLES_PER_FRAME_MAX * CHANNELS * BYTES_PER_SAMPLE)
 #define BLOCK_COUNT           12
-#define PREBUFFER_FRAMES      4
+
+/* i2s_nrfx internal tx_queue holds 4 blocks before START.
+ * Prebuffering 3 blocks leaves headroom for jitter bursts while giving 30 ms reserve. */
+#define PREBUFFER_FRAMES     3
+#define LOW_WATERMARK_BLOCKS 2
 
 K_MEM_SLAB_DEFINE_STATIC(i2s_mem_slab, BLOCK_SIZE, BLOCK_COUNT, 4);
 
-static const struct device * const i2s_dev        = DEVICE_DT_GET(I2S_NODE);
-static bool                        tx_running     = false;
-static int                         buffered_count = 0;
+static const struct device * const i2s_dev          = DEVICE_DT_GET(I2S_NODE);
+static bool                        tx_running       = false;
+static int                         buffered_count   = 0;
+static int16_t                     last_mono_sample = 0;
+static int16_t                     last_frame_stereo[SAMPLES_PER_FRAME_MAX * CHANNELS];
 
 int
 audio_i2s_init(uint32_t sample_rate_hz)
@@ -39,7 +45,7 @@ audio_i2s_init(uint32_t sample_rate_hz)
         .frame_clk_freq = sample_rate_hz,
         .mem_slab       = &i2s_mem_slab,
         .block_size     = BLOCK_SIZE,
-        .timeout        = 0, // CRITICAL: Non-blocking (K_NO_WAIT) to protect BLE RX thread
+        .timeout        = 15, /* Safe in dedicated worker thread; prevents -EAGAIN drops */
     };
 
     int err = i2s_configure(i2s_dev, I2S_DIR_TX, &config);
@@ -49,8 +55,11 @@ audio_i2s_init(uint32_t sample_rate_hz)
         return err;
     }
 
-    tx_running     = false;
-    buffered_count = 0;
+    tx_running       = false;
+    buffered_count   = 0;
+    last_mono_sample = 0;
+    memset(last_frame_stereo, 0, sizeof(last_frame_stereo));
+
     LOG_INF("I2S initialized in READY state (%u Hz)", sample_rate_hz);
     return 0;
 }
@@ -63,45 +72,112 @@ audio_i2s_stop(void)
         i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
         tx_running = false;
     }
-    buffered_count = 0;
+    else
+    {
+        i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_DROP);
+    }
+
+    buffered_count   = 0;
+    last_mono_sample = 0;
+    memset(last_frame_stereo, 0, sizeof(last_frame_stereo));
     LOG_INF("I2S TX stopped");
+}
+
+static void
+build_pad_frame(int16_t *dst, int16_t start_sample, int16_t end_sample, size_t num_samples)
+{
+    /* Smoothly ramp from start_sample to end_sample to avoid step discontinuities */
+    for (size_t i = 0; i < num_samples; i++)
+    {
+        int32_t interp = start_sample + (((int32_t)(end_sample - start_sample) * (int32_t)i) / (int32_t)num_samples);
+        dst[2 * i]     = (int16_t)interp;
+        dst[2 * i + 1] = (int16_t)interp;
+    }
 }
 
 int
 audio_i2s_write_frame(const int16_t *mono_pcm, size_t num_samples)
 {
-    if (!mono_pcm || num_samples > SAMPLES_PER_FRAME_MAX)
+    if (!mono_pcm || num_samples == 0 || num_samples > SAMPLES_PER_FRAME_MAX)
     {
         return -EINVAL;
     }
 
-    void *tx_buf;
-    int   err = k_mem_slab_alloc(&i2s_mem_slab, &tx_buf, K_NO_WAIT);
+    size_t payload_bytes = num_samples * CHANNELS * BYTES_PER_SAMPLE;
+
+    /* Low-Watermark Drift Protection:
+     * If EasyDMA is down to <= 2 blocks in flight while running, inject a smooth
+     * bridge frame before queuing the new frame so DMA never hits empty. */
+    if (tx_running && k_mem_slab_num_used_get(&i2s_mem_slab) <= LOW_WATERMARK_BLOCKS)
+    {
+        void *pad_buf = NULL;
+        if (k_mem_slab_alloc(&i2s_mem_slab, &pad_buf, K_NO_WAIT) == 0)
+        {
+            build_pad_frame((int16_t *)pad_buf, last_mono_sample, mono_pcm[0], num_samples);
+            if (i2s_write(i2s_dev, pad_buf, payload_bytes) != 0)
+            {
+                k_mem_slab_free(&i2s_mem_slab, pad_buf);
+            }
+        }
+    }
+
+    void *tx_buf = NULL;
+    int   err    = k_mem_slab_alloc(&i2s_mem_slab, &tx_buf, K_MSEC(15));
     if (err)
     {
-        // Discard frame cleanly if ring pool is full to prevent ISO thread starvation
         return -ENOBUFS;
     }
 
-    // Interleave single incoming channel into both Left and Right DAC channels
     int16_t *out = (int16_t *)tx_buf;
     for (size_t i = 0; i < num_samples; i++)
     {
-        out[2 * i]     = mono_pcm[i]; // Left
-        out[2 * i + 1] = mono_pcm[i]; // Right
+        out[2 * i]     = mono_pcm[i];
+        out[2 * i + 1] = mono_pcm[i];
     }
 
-    size_t payload_bytes = num_samples * CHANNELS * BYTES_PER_SAMPLE;
-    err                  = i2s_write(i2s_dev, tx_buf, payload_bytes);
+    last_mono_sample = mono_pcm[num_samples - 1];
+    memcpy(last_frame_stereo, out, payload_bytes);
 
-    // If an underrun forced the driver into State 4 (Error), recover cleanly
+    err = i2s_write(i2s_dev, tx_buf, payload_bytes);
+
+    /* Instantaneous recovery if State 4 (Error) ever occurs */
     if (err == -EIO)
     {
-        LOG_WRN("I2S underrun recovered, resetting state machine");
+        LOG_WRN("I2S underrun detected, performing instant restart");
         i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_PREPARE);
         tx_running     = false;
         buffered_count = 0;
-        err            = i2s_write(i2s_dev, tx_buf, payload_bytes);
+
+        /* Pre-load one cached block + current block and restart immediately */
+        void *lookahead_buf = NULL;
+        if (k_mem_slab_alloc(&i2s_mem_slab, &lookahead_buf, K_NO_WAIT) == 0)
+        {
+            memcpy(lookahead_buf, last_frame_stereo, payload_bytes);
+            if (i2s_write(i2s_dev, lookahead_buf, payload_bytes) == 0)
+            {
+                buffered_count++;
+            }
+            else
+            {
+                k_mem_slab_free(&i2s_mem_slab, lookahead_buf);
+            }
+        }
+
+        err = i2s_write(i2s_dev, tx_buf, payload_bytes);
+        if (err == 0)
+        {
+            buffered_count++;
+            if (i2s_trigger(i2s_dev, I2S_DIR_TX, I2S_TRIGGER_START) == 0)
+            {
+                tx_running = true;
+            }
+        }
+        else
+        {
+            k_mem_slab_free(&i2s_mem_slab, tx_buf);
+            return err;
+        }
+        return 0;
     }
 
     if (err < 0)
@@ -110,7 +186,7 @@ audio_i2s_write_frame(const int16_t *mono_pcm, size_t num_samples)
         return err;
     }
 
-    // Trigger DMA engine once prebuffer depth is satisfied
+    /* Trigger DMA engine once prebuffer depth is satisfied */
     if (!tx_running)
     {
         buffered_count++;

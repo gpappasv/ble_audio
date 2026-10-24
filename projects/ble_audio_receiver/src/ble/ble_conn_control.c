@@ -1,6 +1,8 @@
 #include "ble_conn_control.h"
 #include "ble_bap_unicast_server.h"
+#include "../dac/audio_i2s.h"
 
+#include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
@@ -13,8 +15,16 @@ LOG_MODULE_REGISTER(ble_conn, LOG_LEVEL_INF);
 
 static struct bt_conn       *ble_connection;
 static struct bt_le_ext_adv *adv;
+static struct k_work         adv_work;
 
 static void start_adv(void);
+
+static void
+adv_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    start_adv();
+}
 
 // ASCS Targeted Announcement metadata
 static uint8_t unicast_server_addata[] = {
@@ -42,7 +52,7 @@ connected(struct bt_conn *conn, uint8_t err)
     {
         LOG_ERR("Connection failed: %s (err %u)", addr, err);
         ble_connection = NULL;
-        start_adv();
+        k_work_submit(&adv_work);
         return;
     }
 
@@ -68,11 +78,14 @@ disconnected(struct bt_conn *conn, uint8_t reason)
 
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
     LOG_INF("Disconnected: %s (reason 0x%02x)", addr, reason);
+
+    audio_i2s_stop();
+
     bt_conn_unref(ble_connection);
     ble_connection = NULL;
 
-    // Automatically re-advertise for the next session
-    start_adv();
+    // Re-advertise via workqueue after conn context is fully freed
+    k_work_submit(&adv_work);
 }
 
 static void
@@ -129,6 +142,8 @@ start_adv(void)
 void
 ble_conn_control_start(void)
 {
+    k_work_init(&adv_work, adv_work_handler);
+
     int err = bt_enable(NULL);
     if (err)
     {
