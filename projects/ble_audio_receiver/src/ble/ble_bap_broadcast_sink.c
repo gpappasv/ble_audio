@@ -90,7 +90,6 @@ notify_phone_bis_state(uint32_t bis_sync_mask)
         return;
     }
 
-    /* Guard: Zephyr rejects BIS state updates with -EINVAL (-22) if PA is NOT_SYNCED */
     if (current_pa_state == BT_BAP_PA_STATE_NOT_SYNCED && bis_sync_mask != 0U)
     {
         return;
@@ -160,11 +159,29 @@ teardown_pa_and_sink(void)
         }
     }
 
-    /* 1. Clear BIS sync state first while PA is still considered active */
+    /* 1. Clear BIS sync state first while PA is still marked active */
     notify_phone_bis_state(0U);
 
     /* 2. Clear PA state second */
     notify_phone_pa_state(BT_BAP_PA_STATE_NOT_SYNCED);
+
+    /* 3. Purge the BASS source slot so Android doesn't see a lingering 'paused' stream */
+    if (has_active_src_id)
+    {
+        uint8_t src_to_rem = active_src_id;
+        has_active_src_id  = false;
+        active_src_id      = 0;
+
+        int err = bt_bap_scan_delegator_rem_src(src_to_rem);
+        if (err != 0 && err != -ENOENT)
+        {
+            LOG_WRN("Failed removing BASS source %u (err %d)", src_to_rem, err);
+        }
+        else
+        {
+            LOG_INF("BASS source %u purged from Scan Delegator", src_to_rem);
+        }
+    }
 
     pending_full_reset = false;
     big_stopping       = false;
@@ -179,17 +196,20 @@ teardown_pa_and_sink(void)
     if (pa_sync != NULL)
     {
         struct bt_le_per_adv_sync *sync_to_delete = pa_sync;
-        pa_sync = NULL; /* Nullify before deleting so pa_term_cb avoids recursive cleanup */
+        pa_sync                                   = NULL;
         bt_le_per_adv_sync_delete(sync_to_delete);
     }
 
     ble_audio_stream_reset_broadcast();
+    audio_i2s_stop();
 
-    base_bis_bitfield = 0;
-    base_bis_count    = 0;
-    base_received     = false;
-    sink_syncable     = false;
-    sink_encrypted    = false;
+    base_bis_bitfield   = 0;
+    base_bis_count      = 0;
+    base_received       = false;
+    sink_syncable       = false;
+    sink_encrypted      = false;
+    target_broadcast_id = INVALID_BROADCAST_ID;
+    current_pa_state    = BT_BAP_PA_STATE_NOT_SYNCED;
 }
 
 /* --- Periodic Advertising Callbacks --- */
@@ -345,14 +365,7 @@ static void
 recv_state_updated_cb(struct bt_conn *conn, const struct bt_bap_scan_delegator_recv_state *recv_state)
 {
     ARG_UNUSED(conn);
-
-    if (recv_state != NULL)
-    {
-        req_recv_state      = recv_state;
-        active_src_id       = recv_state->src_id;
-        has_active_src_id   = true;
-        target_broadcast_id = recv_state->broadcast_id;
-    }
+    req_recv_state = recv_state;
 }
 
 static int
@@ -486,6 +499,7 @@ bis_sync_req_cb(struct bt_conn                                *conn,
 
     if (req_bits == 0U)
     {
+        /* Normal in-session pause: stop BIG stream but keep PA and source alive */
         requested_bis_sync = 0U;
         notify_phone_bis_state(0U);
         if (big_synced && !big_stopping && broadcast_sink != NULL)
@@ -501,7 +515,6 @@ bis_sync_req_cb(struct bt_conn                                *conn,
 
     if (big_synced)
     {
-        /* Acknowledge immediately so Android registers the sync */
         notify_phone_bis_state(req_bits);
     }
     else if (base_received && sink_syncable && !big_stopping)
@@ -623,8 +636,12 @@ big_stopped_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    big_synced   = false;
-    big_stopping = false;
+    big_synced    = false;
+    big_stopping  = false;
+    sink_syncable = false;
+    base_received = false;
+
+    audio_i2s_stop();
 
     if (pending_full_reset || suspended_by_unicast || pa_sync == NULL)
     {
@@ -703,6 +720,13 @@ ble_bap_broadcast_sink_on_big_stopped(void)
 {
     LOG_INF("Auracast BIG stream stopped");
     k_work_submit(&big_stopped_work);
+}
+
+void
+ble_bap_broadcast_sink_stop_and_cleanup(void)
+{
+    LOG_INF("Explicit stop and cleanup of Broadcast Sink");
+    teardown_pa_and_sink();
 }
 
 void

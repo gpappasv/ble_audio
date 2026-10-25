@@ -6,6 +6,7 @@
 void ble_bap_broadcast_sink_start(void);
 void ble_bap_broadcast_sink_suspend(void);
 void ble_bap_broadcast_sink_resume(void);
+void ble_bap_broadcast_sink_stop_and_cleanup(void);
 void ble_bap_broadcast_sink_on_connected(struct bt_conn *conn);
 void ble_bap_broadcast_sink_on_big_stopped(void);
 

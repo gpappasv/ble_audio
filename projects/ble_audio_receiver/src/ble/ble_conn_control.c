@@ -147,16 +147,16 @@ disconnected(struct bt_conn *conn, uint8_t reason)
         LOG_INF("Active device disconnected: %s (reason 0x%02x)", addr, reason);
         k_work_cancel_delayable(&sec_work);
 
+        /* Evict Unicast ASEs */
         ble_bap_unicast_server_evict_conn(active_conn);
-        if (!ble_audio_stream_has_active_broadcast())
-        {
-            audio_i2s_stop();
-        }
+
+        /* Clean up Auracast BIG, PA sync, decoders, and halt DAC output */
+        ble_bap_broadcast_sink_stop_and_cleanup();
 
         bt_conn_unref(active_conn);
         active_conn = NULL;
 
-        ble_bap_broadcast_sink_resume();
+        /* Resume standard connectable advertising */
         k_work_reschedule(&adv_work, K_MSEC(150));
         return;
     }
