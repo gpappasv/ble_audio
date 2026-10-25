@@ -28,7 +28,7 @@ static uint32_t     target_broadcast_id = INVALID_BROADCAST_ID;
 
 /* BIS bitfields: what the broadcaster offers (BASE) vs what the phone requested (BASS) */
 static uint32_t base_bis_bitfield  = 0;
-static uint32_t requested_bis_sync = 0;
+static uint32_t requested_bis_sync = BT_BAP_BIS_SYNC_NO_PREF;
 static size_t   base_bis_count     = 0;
 
 /* Broadcast encryption key supplied by the phone via BASS */
@@ -39,11 +39,14 @@ static bool    sink_encrypted     = false;
 static bool base_received        = false;
 static bool sink_syncable        = false;
 static bool big_synced           = false;
+static bool big_stopping         = false;
+static bool pending_full_reset   = false;
 static bool scanning_for_pa      = false;
 static bool suspended_by_unicast = false;
 
 static struct k_work_delayable pa_create_work;
 static struct k_work           big_sync_work;
+static struct k_work           big_stopped_work;
 static struct k_work           cleanup_work;
 static struct k_work_delayable watchdog_work;
 
@@ -69,19 +72,40 @@ stop_pa_scan_if_active(void)
 }
 
 static void
-reset_sink_context(void)
+teardown_pa_and_sink(void)
 {
     k_work_cancel_delayable(&pa_create_work);
     k_work_cancel_delayable(&watchdog_work);
 
     stop_pa_scan_if_active();
 
+    /* If BIG is currently active, stop BIG first and wait for big_stopped_work
+     * so Zephyr cleanly detaches stream->ep and stream->group before sink deletion. */
+    if (broadcast_sink != NULL && big_synced)
+    {
+        pending_full_reset = true;
+        if (!big_stopping)
+        {
+            big_stopping = true;
+            int err      = bt_bap_broadcast_sink_stop(broadcast_sink);
+            if (err == 0 || err == -EALREADY)
+            {
+                return;
+            }
+            big_stopping = false;
+        }
+        else
+        {
+            return;
+        }
+    }
+
+    pending_full_reset = false;
+    big_stopping       = false;
+    big_synced         = false;
+
     if (broadcast_sink != NULL)
     {
-        if (big_synced)
-        {
-            bt_bap_broadcast_sink_stop(broadcast_sink);
-        }
         bt_bap_broadcast_sink_delete(broadcast_sink);
         broadcast_sink = NULL;
     }
@@ -94,17 +118,11 @@ reset_sink_context(void)
 
     ble_audio_stream_reset_broadcast();
 
-    req_recv_state      = NULL;
-    target_broadcast_id = INVALID_BROADCAST_ID;
-    base_bis_bitfield   = 0;
-    requested_bis_sync  = 0;
-    base_bis_count      = 0;
-    base_received       = false;
-    sink_syncable       = false;
-    sink_encrypted      = false;
-    big_synced          = false;
-    has_broadcast_code  = false;
-    memset(stored_broadcast_code, 0, sizeof(stored_broadcast_code));
+    base_bis_bitfield = 0;
+    base_bis_count    = 0;
+    base_received     = false;
+    sink_syncable     = false;
+    sink_encrypted    = false;
 }
 
 /* --- Periodic Advertising Callbacks --- */
@@ -118,8 +136,9 @@ pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_i
         return;
     }
 
-    /* Stop any temporary helper scan immediately once PA is locked */
+    /* PA is locked: cancel helper scan and PA watchdog */
     k_work_cancel_delayable(&pa_create_work);
+    k_work_cancel_delayable(&watchdog_work);
     stop_pa_scan_if_active();
 
     pa_sync = sync;
@@ -133,7 +152,20 @@ pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_i
             (info->conn != NULL) ? "via Phone PAST" : "Direct RF",
             target_broadcast_id);
 
-    if (broadcast_sink == NULL && target_broadcast_id != INVALID_BROADCAST_ID)
+    if (broadcast_sink != NULL)
+    {
+        bt_bap_broadcast_sink_delete(broadcast_sink);
+        broadcast_sink = NULL;
+    }
+
+    base_bis_bitfield = 0;
+    base_bis_count    = 0;
+    base_received     = false;
+    sink_syncable     = false;
+    big_synced        = false;
+    big_stopping      = false;
+
+    if (target_broadcast_id != INVALID_BROADCAST_ID)
     {
         int err = bt_bap_broadcast_sink_create(pa_sync, target_broadcast_id, &broadcast_sink);
         if (err != 0)
@@ -143,8 +175,6 @@ pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_i
             return;
         }
     }
-
-    k_work_reschedule(&watchdog_work, K_MSEC(PA_SYNC_TIMEOUT_MS));
 }
 
 static void
@@ -158,10 +188,7 @@ pa_term_cb(struct bt_le_per_adv_sync *sync, const struct bt_le_per_adv_sync_term
     LOG_INF("PA sync terminated (reason 0x%02X)", info->reason);
     pa_sync = NULL;
 
-    if (!big_synced)
-    {
-        k_work_submit(&cleanup_work);
-    }
+    k_work_submit(&cleanup_work);
 }
 
 static struct bt_le_per_adv_sync_cb pa_sync_cbs = {
@@ -214,7 +241,7 @@ base_recv_cb(struct bt_bap_broadcast_sink *sink, const struct bt_bap_base *base,
     base_bis_bitfield = bis_bitfield;
     base_received     = true;
 
-    if (sink_syncable && !big_synced && requested_bis_sync != 0U)
+    if (sink_syncable && !big_synced && !big_stopping && requested_bis_sync != 0U)
     {
         k_work_submit(&big_sync_work);
     }
@@ -223,7 +250,7 @@ base_recv_cb(struct bt_bap_broadcast_sink *sink, const struct bt_bap_base *base,
 static void
 syncable_cb(struct bt_bap_broadcast_sink *sink, const struct bt_iso_biginfo *biginfo)
 {
-    if (sink != broadcast_sink || suspended_by_unicast || big_synced)
+    if (sink != broadcast_sink || suspended_by_unicast || big_synced || big_stopping)
     {
         return;
     }
@@ -270,21 +297,28 @@ pa_sync_req_cb(struct bt_conn                                *conn,
         return -EBUSY;
     }
 
+    bool same_broadcaster = (target_broadcast_id == recv_state->broadcast_id)
+                            && (bt_addr_le_cmp(&target_addr, &recv_state->addr) == 0)
+                            && (target_sid == recv_state->adv_sid);
+
     req_recv_state      = recv_state;
     target_broadcast_id = recv_state->broadcast_id;
     target_sid          = recv_state->adv_sid;
     target_interval     = interval;
     bt_addr_le_copy(&target_addr, &recv_state->addr);
 
-    /* Extract initial requested BIS bitfield if already populated in Add Source */
-    uint32_t init_bis = 0U;
+    uint32_t state_bis = 0U;
     for (size_t i = 0; i < recv_state->num_subgroups; i++)
     {
-        init_bis |= recv_state->subgroups[i].bis_sync;
+        state_bis |= recv_state->subgroups[i].bis_sync;
     }
-    if (init_bis != 0U)
+    if (state_bis != 0U)
     {
-        requested_bis_sync = init_bis;
+        requested_bis_sync = state_bis;
+    }
+    else if (requested_bis_sync == 0U)
+    {
+        requested_bis_sync = BT_BAP_BIS_SYNC_NO_PREF;
     }
 
     char addr_str[BT_ADDR_LE_STR_LEN];
@@ -297,12 +331,18 @@ pa_sync_req_cb(struct bt_conn                                *conn,
 
     if (pa_sync != NULL)
     {
-        return 0;
+        if (same_broadcaster)
+        {
+            if (base_received && sink_syncable && !big_synced && !big_stopping && requested_bis_sync != 0U)
+            {
+                k_work_submit(&big_sync_work);
+            }
+            return 0;
+        }
+
+        teardown_pa_and_sink();
     }
 
-    /* If the phone supports PAST, give it 1.2s to transfer the sync over ACL.
-     * If PAST is not available (or doesn't arrive within 1.2s), pa_create_work
-     * automatically creates the PA sync directly. */
     if (past_avail)
     {
         k_work_reschedule(&pa_create_work, K_MSEC(PAST_FALLBACK_DELAY_MS));
@@ -322,6 +362,7 @@ pa_sync_term_req_cb(struct bt_conn *conn, const struct bt_bap_scan_delegator_rec
     ARG_UNUSED(recv_state);
 
     LOG_INF("Phone requested PA sync termination");
+    requested_bis_sync = 0U;
     k_work_submit(&cleanup_work);
     return 0;
 }
@@ -338,7 +379,7 @@ broadcast_code_cb(struct bt_conn                                *conn,
     has_broadcast_code = true;
     LOG_INF("Received Broadcast Code from phone");
 
-    if (base_received && sink_syncable && !big_synced && requested_bis_sync != 0U)
+    if (base_received && sink_syncable && !big_synced && !big_stopping && requested_bis_sync != 0U)
     {
         k_work_submit(&big_sync_work);
     }
@@ -362,10 +403,11 @@ bis_sync_req_cb(struct bt_conn                                *conn,
 
     if (req_bits == 0U)
     {
-        /* Phone commanded to stop listening to the broadcast */
+        /* Phone paused broadcast reception: stop BIG stream ONLY, keep PA sync alive */
         requested_bis_sync = 0U;
-        if (big_synced && broadcast_sink != NULL)
+        if (big_synced && !big_stopping && broadcast_sink != NULL)
         {
+            big_stopping = true;
             bt_bap_broadcast_sink_stop(broadcast_sink);
         }
         audio_i2s_stop();
@@ -374,7 +416,7 @@ bis_sync_req_cb(struct bt_conn                                *conn,
 
     requested_bis_sync = req_bits;
 
-    if (base_received && sink_syncable && !big_synced)
+    if (base_received && sink_syncable && !big_synced && !big_stopping)
     {
         k_work_submit(&big_sync_work);
     }
@@ -416,8 +458,6 @@ pa_create_work_handler(struct k_work *work)
         return;
     }
 
-    /* The BLE Controller requires passive scanning enabled briefly to catch the
-     * AUX_SYNC_IND pointer when syncing without PAST. Stopped as soon as pa_synced_cb fires. */
     err = bt_le_scan_start(BT_LE_SCAN_PASSIVE, NULL);
     if (err == 0 || err == -EALREADY)
     {
@@ -433,7 +473,8 @@ big_sync_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    if (suspended_by_unicast || broadcast_sink == NULL || !base_received || !sink_syncable || big_synced)
+    if (suspended_by_unicast || broadcast_sink == NULL || !base_received || !sink_syncable || big_synced || big_stopping
+        || requested_bis_sync == 0U)
     {
         return;
     }
@@ -444,9 +485,8 @@ big_sync_work_handler(struct k_work *work)
         return;
     }
 
-    /* If phone passed BT_BAP_BIS_SYNC_NO_PREF (0xFFFFFFFF), sync to all BIS in BASE */
     uint32_t sync_bitfield = base_bis_bitfield;
-    if (requested_bis_sync != 0U && requested_bis_sync != BT_BAP_BIS_SYNC_NO_PREF)
+    if (requested_bis_sync != BT_BAP_BIS_SYNC_NO_PREF)
     {
         sync_bitfield = base_bis_bitfield & requested_bis_sync;
         if (sync_bitfield == 0U)
@@ -479,7 +519,6 @@ big_sync_work_handler(struct k_work *work)
     if (err != 0)
     {
         LOG_ERR("Failed syncing to Broadcast Sink BIG (err %d)", err);
-        k_work_submit(&cleanup_work);
         return;
     }
 
@@ -488,10 +527,27 @@ big_sync_work_handler(struct k_work *work)
 }
 
 static void
+big_stopped_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+
+    big_synced   = false;
+    big_stopping = false;
+    /* Require a fresh BASE + BIGInfo (syncable_cb) before any future BIG sync attempt */
+    sink_syncable = false;
+    base_received = false;
+
+    if (pending_full_reset || suspended_by_unicast || pa_sync == NULL)
+    {
+        teardown_pa_and_sink();
+    }
+}
+
+static void
 cleanup_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-    reset_sink_context();
+    teardown_pa_and_sink();
 }
 
 static void
@@ -499,9 +555,9 @@ watchdog_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    if (!big_synced)
+    if (pa_sync != NULL && broadcast_sink == NULL)
     {
-        LOG_WRN("Auracast PA/BIG sync timed out; cleaning up");
+        LOG_WRN("Periodic Advertising lock timed out; cleaning up");
         k_work_submit(&cleanup_work);
     }
 }
@@ -509,7 +565,6 @@ watchdog_work_handler(struct k_work *work)
 void
 ble_bap_broadcast_sink_on_connected(struct bt_conn *conn)
 {
-    /* Enable PAST receiver on the connection so the phone can transfer PA sync directly */
     struct bt_le_per_adv_sync_transfer_param past_param = {
         .skip    = 0,
         .timeout = 400, /* 4.0s */
@@ -529,7 +584,7 @@ ble_bap_broadcast_sink_suspend(void)
     suspended_by_unicast = true;
 
     bool had_activity = scanning_for_pa || (pa_sync != NULL) || (broadcast_sink != NULL);
-    reset_sink_context();
+    teardown_pa_and_sink();
 
     if (had_activity)
     {
@@ -551,12 +606,7 @@ void
 ble_bap_broadcast_sink_on_big_stopped(void)
 {
     LOG_INF("Auracast BIG stream stopped");
-    big_synced = false;
-
-    if (requested_bis_sync == 0U || pa_sync == NULL)
-    {
-        k_work_submit(&cleanup_work);
-    }
+    k_work_submit(&big_stopped_work);
 }
 
 void
@@ -564,6 +614,7 @@ ble_bap_broadcast_sink_start(void)
 {
     k_work_init_delayable(&pa_create_work, pa_create_work_handler);
     k_work_init(&big_sync_work, big_sync_work_handler);
+    k_work_init(&big_stopped_work, big_stopped_work_handler);
     k_work_init(&cleanup_work, cleanup_work_handler);
     k_work_init_delayable(&watchdog_work, watchdog_work_handler);
 
