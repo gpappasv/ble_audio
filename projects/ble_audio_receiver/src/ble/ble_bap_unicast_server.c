@@ -3,6 +3,7 @@
 #include "ble_bap_broadcast_sink.h"
 #include "ble_conn_control.h"
 #include "../dac/audio_i2s.h"
+#include "../hw/board_leds.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/audio/bap.h>
@@ -13,8 +14,6 @@
 
 LOG_MODULE_REGISTER(ble_unicast_server, LOG_LEVEL_INF);
 
-/* Supports 24 kHz (Auracast Standard Quality) and 48 kHz (Unicast & Auracast High Quality),
- * 7.5 ms & 10 ms durations, 1 or 2 channels, 30..120 octets. */
 static const struct bt_audio_codec_cap lc3_codec_cap
     = BT_AUDIO_CODEC_CAP_LC3((BT_AUDIO_CODEC_CAP_FREQ_24KHZ | BT_AUDIO_CODEC_CAP_FREQ_48KHZ),
                              (BT_AUDIO_CODEC_CAP_DURATION_7_5 | BT_AUDIO_CODEC_CAP_DURATION_10),
@@ -49,8 +48,19 @@ vcs_state_cb(struct bt_conn *conn, int err, uint8_t volume, uint8_t mute)
         return;
     }
 
-    bool is_muted = (mute == BT_VCP_STATE_MUTED);
+    bool is_muted = (mute == BT_VCP_STATE_MUTED) || (volume == 0U);
     audio_i2s_set_volume(volume, is_muted);
+    board_leds_set_muted(is_muted);
+
+    if (volume == 255U && !is_muted)
+    {
+        board_leds_notify_event(LED_EVT_VOL_MAX);
+    }
+    else
+    {
+        board_leds_notify_event(LED_EVT_VOL_CHANGE);
+    }
+
     LOG_INF("Volume updated: %u / 255 (%u%%), Mute: %s",
             volume,
             (unsigned int)((volume * 100U) / 255U),
@@ -61,6 +71,7 @@ static void
 vcs_flags_cb(struct bt_conn *conn, int err, uint8_t flags)
 {
     ARG_UNUSED(conn);
+    ARG_UNUSED(flags);
     if (err)
     {
         LOG_ERR("VCS flags callback error: %d", err);

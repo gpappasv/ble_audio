@@ -1,5 +1,6 @@
 #include "dac/audio_i2s.h"
 #include "hw/board_buttons.h"
+#include "hw/board_leds.h"
 #include "ble/ble_audio_stream.h"
 #include "ble/ble_bap_unicast_server.h"
 #include "ble/ble_bap_broadcast_sink.h"
@@ -19,10 +20,13 @@ main(void)
 
     LOG_INF("=== AuraLink LE Audio Receiver Starting ===");
 
+    board_leds_init();
+
     err = audio_i2s_init();
     if (err != 0)
     {
         LOG_ERR("Audio I2S / DSP subsystem init failed (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
         return err;
     }
 
@@ -32,6 +36,7 @@ main(void)
     if (err != 0)
     {
         LOG_ERR("Bluetooth stack init failed (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
         return err;
     }
 

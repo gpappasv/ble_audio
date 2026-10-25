@@ -2,6 +2,7 @@
 #include "ble_bap_unicast_server.h"
 #include "ble_bap_broadcast_sink.h"
 #include "../dac/audio_i2s.h"
+#include "../hw/board_leds.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -37,8 +38,8 @@ static uint8_t bap_svc_data[] = {
     BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL),
     BT_AUDIO_UNICAST_ANNOUNCEMENT_GENERAL,
     BT_BYTES_LIST_LE16(AVAILABLE_SINK_CONTEXT),
-    BT_BYTES_LIST_LE16(0x0000), /* Source contexts: None */
-    0x00,                       /* Metadata length: 0 */
+    BT_BYTES_LIST_LE16(0x0000),
+    0x00,
 };
 
 /* BASS Broadcast Audio Scan Service announcement */
@@ -107,6 +108,7 @@ adv_work_handler(struct k_work *work)
     if (err == 0 || err == -EALREADY)
     {
         adv_running = true;
+        board_leds_set_state(LED_STATE_IDLE_ADV);
         LOG_INF("Connectable LE Audio advertising active (%s)", CONFIG_BT_DEVICE_NAME);
     }
     else
@@ -131,7 +133,6 @@ sec_work_handler(struct k_work *work)
     }
 }
 
-/* Step 2 of Button 1 Reset: Runs after ACL link has cleanly terminated */
 static void
 finalize_unpair_work_handler(struct k_work *work)
 {
@@ -154,10 +155,10 @@ finalize_unpair_work_handler(struct k_work *work)
     }
 
     reset_in_prog = false;
+    board_leds_set_state(LED_STATE_IDLE_ADV);
     k_work_reschedule(&adv_work, K_MSEC(100));
 }
 
-/* Step 1 of Button 1 Reset: Evicts streams, disconnects active phone, schedules bond wipe */
 static void
 evict_reset_work_handler(struct k_work *work)
 {
@@ -169,11 +170,9 @@ evict_reset_work_handler(struct k_work *work)
 
     stop_advertising_if_active();
 
-    /* 1. Kill Auracast sink & purge BASS source slots */
     ble_bap_broadcast_sink_stop_and_cleanup();
     ble_bap_broadcast_sink_resume();
 
-    /* 2. Evict Unicast streams and kick out connected phone if present */
     if (active_conn != NULL)
     {
         ble_bap_unicast_server_evict_conn(active_conn);
@@ -183,7 +182,6 @@ evict_reset_work_handler(struct k_work *work)
         int err = bt_conn_disconnect(active_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
         if (err == 0 || err == -EALREADY)
         {
-            /* Allow 250ms for LL_TERMINATE_IND to complete over the air */
             k_work_reschedule(&finalize_unpair_work, K_MSEC(250));
             return;
         }
@@ -192,7 +190,6 @@ evict_reset_work_handler(struct k_work *work)
         active_conn = NULL;
     }
 
-    /* No active connection: wipe bonds immediately */
     k_work_reschedule(&finalize_unpair_work, K_NO_WAIT);
 }
 
@@ -226,6 +223,8 @@ connected(struct bt_conn *conn, uint8_t err)
     adv_running = false;
 
     LOG_INF("Connected: %s", addr);
+    board_leds_set_state(LED_STATE_CONNECTED_IDLE);
+    board_leds_notify_event(LED_EVT_CONNECTED);
 
     ble_bap_broadcast_sink_on_connected(conn);
     k_work_reschedule(&sec_work, K_MSEC(300));
@@ -249,9 +248,14 @@ disconnected(struct bt_conn *conn, uint8_t reason)
         bt_conn_unref(active_conn);
         active_conn = NULL;
 
+        board_leds_set_state(LED_STATE_IDLE_ADV);
+        if (!reset_in_prog)
+        {
+            board_leds_notify_event(LED_EVT_DISCONNECTED);
+        }
+
         if (reset_in_prog)
         {
-            /* Disconnect finished during Button 1 reset: proceed immediately to bond wipe */
             k_work_reschedule(&finalize_unpair_work, K_MSEC(20));
             return;
         }
@@ -277,6 +281,7 @@ security_changed(struct bt_conn *conn, bt_security_t level, enum bt_security_err
     else
     {
         LOG_WRN("Security elevation failed: level %u, err %d", (unsigned int)level, err);
+        board_leds_notify_event(LED_EVT_ERROR);
         if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING)
         {
             LOG_WRN("Peer missing bond key -> Purging stale local bond");

@@ -9,6 +9,7 @@ target_sources(app PRIVATE
     src/dsp/audio_dsp.c
     src/diag/audio_telemetry.c
     src/hw/board_buttons.c
+    src/hw/board_leds.c
     src/dac/audio_i2s.c
     src/ble/ble_conn_control.c
     src/ble/ble_audio_stream.c

@@ -1,4 +1,5 @@
 #include "board_buttons.h"
+#include "board_leds.h"
 #include "../ble/ble_conn_control.h"
 
 #include <zephyr/kernel.h>
@@ -21,11 +22,11 @@ button_debounce_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
 
-    /* Confirm button is still physically pressed after 50ms debounce window */
     int val = gpio_pin_get_dt(&button_sw0);
     if (val > 0)
     {
         LOG_INF("Button 1 pressed -> Triggering full BLE eviction & bond reset");
+        board_leds_notify_event(LED_EVT_RESET_BONDS);
         ble_conn_control_reset_all_and_unpair();
     }
 }

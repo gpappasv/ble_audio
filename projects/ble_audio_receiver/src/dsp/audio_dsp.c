@@ -4,10 +4,12 @@
 #include <zephyr/sys/util.h>
 #include <string.h>
 
-/* 10 ms fade-in duration at 48 kHz = 480 samples -> step = 32767 / 480 = 68 */
-#define FADE_IN_STEP_Q15    68
-#define UNITY_GAIN_Q15      32767
-#define SOFT_KNEE_THRESHOLD 28672 /* ~ -1.15 dBFS */
+/* 10 ms startup fade-in at 48 kHz = 480 samples -> step = 68 */
+#define FADE_IN_STEP_Q15 68
+/* 2 ms post-PLC recovery slew at 48 kHz = 96 samples -> step = 341 */
+#define PLC_RECOVERY_STEP_Q15 341
+#define UNITY_GAIN_Q15        32767
+#define SOFT_KNEE_THRESHOLD   28672 /* ~ -1.15 dBFS */
 
 struct dc_blocker_state
 {
@@ -15,8 +17,7 @@ struct dc_blocker_state
     int32_t acc_q8;
 };
 
-/* 17-point logarithmic volume lookup table (0..256 in steps of 16)
- * Maps VCP 0..255 across a natural 56 dB psychoacoustic dynamic range in Q15. */
+/* 17-point logarithmic volume lookup table (0..256 in steps of 16) */
 static const uint16_t vcp_log_lut_q15[17] = {
     0,     /*   0: Mute (-inf dB) */
     52,    /*  16: -56.0 dB */
@@ -37,12 +38,27 @@ static const uint16_t vcp_log_lut_q15[17] = {
     32767  /* 256:   0.0 dB */
 };
 
+/* Progressive PLC burst-loss attenuation table (Q15) */
+static const uint16_t plc_decay_lut_q15[6] = {
+    32767, /* 0 consecutive PLC frames: 100% (0.0 dB) */
+    32767, /* 1st PLC frame:            100% (0.0 dB) */
+    27852, /* 2nd consecutive PLC:       85% (-1.4 dB) */
+    21299, /* 3rd consecutive PLC:       65% (-3.7 dB) */
+    13107, /* 4th consecutive PLC:       40% (-8.0 dB) */
+    0      /* 5+ consecutive PLC:         0% (Mute synthetic artifacts) */
+};
+
 static struct dc_blocker_state dc_left;
 static struct dc_blocker_state dc_right;
 
 static int32_t target_gain_q23  = (24576 << 8);
 static int32_t current_gain_q23 = (24576 << 8);
 static int32_t fade_env_q15     = 0;
+
+/* PLC burst attenuation envelope state */
+static uint8_t plc_burst_count = 0;
+static int32_t plc_target_q15  = UNITY_GAIN_Q15;
+static int32_t plc_current_q15 = UNITY_GAIN_Q15;
 
 static int16_t last_sample_l = 0;
 static int16_t last_sample_r = 0;
@@ -70,8 +86,6 @@ sat16(int32_t x)
 static inline int32_t
 apply_dc_blocker(struct dc_blocker_state *st, int16_t x)
 {
-    /* 1st-order high-pass filter: y[n] = x[n] - x[n-1] + (1 - 2^-9) * y[n-1]
-     * Cutoff ~14.9 Hz at 48 kHz. State kept in Q8 to prevent quantization limit cycles. */
     int32_t diff_q8 = ((int32_t)x - st->prev_x) << 8;
     st->prev_x      = (int32_t)x;
     st->acc_q8      = diff_q8 + st->acc_q8 - (st->acc_q8 >> 9);
@@ -104,8 +118,8 @@ vcp_volume_to_q15(uint8_t vcp_vol, bool muted)
         return UNITY_GAIN_Q15;
     }
 
-    uint32_t idx  = vcp_vol >> 4;    /* 0..15 */
-    uint32_t frac = vcp_vol & 0x0FU; /* 0..15 */
+    uint32_t idx  = vcp_vol >> 4;
+    uint32_t frac = vcp_vol & 0x0FU;
 
     uint32_t y0 = vcp_log_lut_q15[idx];
     uint32_t y1 = vcp_log_lut_q15[idx + 1U];
@@ -118,9 +132,12 @@ audio_dsp_init(void)
 {
     memset(&dc_left, 0, sizeof(dc_left));
     memset(&dc_right, 0, sizeof(dc_right));
-    fade_env_q15  = 0;
-    last_sample_l = 0;
-    last_sample_r = 0;
+    fade_env_q15    = 0;
+    plc_burst_count = 0;
+    plc_target_q15  = UNITY_GAIN_Q15;
+    plc_current_q15 = UNITY_GAIN_Q15;
+    last_sample_l   = 0;
+    last_sample_r   = 0;
 }
 
 void
@@ -136,9 +153,30 @@ audio_dsp_notify_stream_start(void)
     memset(&dc_left, 0, sizeof(dc_left));
     memset(&dc_right, 0, sizeof(dc_right));
     fade_env_q15     = 0;
+    plc_burst_count  = 0;
+    plc_target_q15   = UNITY_GAIN_Q15;
+    plc_current_q15  = UNITY_GAIN_Q15;
     current_gain_q23 = target_gain_q23;
     last_sample_l    = 0;
     last_sample_r    = 0;
+}
+
+void
+audio_dsp_notify_plc(bool is_plc_frame)
+{
+    if (is_plc_frame)
+    {
+        if (plc_burst_count < 5U)
+        {
+            plc_burst_count++;
+        }
+        plc_target_q15 = (int32_t)plc_decay_lut_q15[plc_burst_count];
+    }
+    else
+    {
+        plc_burst_count = 0;
+        plc_target_q15  = UNITY_GAIN_Q15;
+    }
 }
 
 void
@@ -147,7 +185,7 @@ audio_dsp_process_stereo(
 {
     for (size_t i = 0; i < num_samples; i++)
     {
-        /* 1. Per-sample volume slew (de-zippering, tau ~ 2.67 ms) */
+        /* 1. Per-sample volume slew (de-zippering) */
         current_gain_q23 += (target_gain_q23 - current_gain_q23) >> 7;
         int32_t vol_q15 = current_gain_q23 >> 8;
 
@@ -161,13 +199,32 @@ audio_dsp_process_stereo(
             }
         }
 
-        int32_t combined_gain_q15 = (vol_q15 * fade_env_q15) >> 15;
+        /* 3. PLC burst-loss decay & 2 ms smooth recovery slew */
+        if (plc_current_q15 < plc_target_q15)
+        {
+            plc_current_q15 += PLC_RECOVERY_STEP_Q15;
+            if (plc_current_q15 > plc_target_q15)
+            {
+                plc_current_q15 = plc_target_q15;
+            }
+        }
+        else if (plc_current_q15 > plc_target_q15)
+        {
+            plc_current_q15 -= PLC_RECOVERY_STEP_Q15;
+            if (plc_current_q15 < plc_target_q15)
+            {
+                plc_current_q15 = plc_target_q15;
+            }
+        }
 
-        /* 3. Subsonic DC Blocker */
+        int32_t env_q15           = (fade_env_q15 * plc_current_q15) >> 15;
+        int32_t combined_gain_q15 = (vol_q15 * env_q15) >> 15;
+
+        /* 4. Subsonic DC Blocker */
         int32_t clean_l = apply_dc_blocker(&dc_left, in_left[i]);
         int32_t clean_r = apply_dc_blocker(&dc_right, in_right[i]);
 
-        /* 4. Gain scaling + Soft-knee limiter + Hardware SSAT */
+        /* 5. Gain scaling + Soft-knee limiter + Hardware SSAT */
         int32_t scaled_l = (clean_l * combined_gain_q15) >> 15;
         int32_t scaled_r = (clean_r * combined_gain_q15) >> 15;
 
