@@ -2,6 +2,7 @@
 #include "ble_conn_control.h"
 #include "ble_bap_broadcast_sink.h"
 #include "../dac/audio_i2s.h"
+#include "../diag/audio_telemetry.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -34,6 +35,7 @@ struct lc3_sdu_packet
 {
     uint8_t  stream_idx;
     uint8_t  status;
+    uint16_t seq_num;
     uint16_t len;
     uint8_t  data[MAX_SDU_BUF_SIZE];
 };
@@ -45,8 +47,12 @@ static lc3_decoder_t         lc3_decoders[MAX_AUDIO_CHANNELS];
 static lc3_decoder_mem_48k_t lc3_decoder_mems[MAX_AUDIO_CHANNELS];
 static int16_t               pcm_left_buf[MAX_NUM_SAMPLES];
 static int16_t               pcm_right_buf[MAX_NUM_SAMPLES];
-static bool                  left_staged  = false;
-static bool                  right_staged = false;
+
+/* Sequence-locked staging for dual-stream stereo alignment */
+static bool     left_staged      = false;
+static bool     right_staged     = false;
+static uint16_t staged_left_seq  = 0;
+static uint16_t staged_right_seq = 0;
 
 static bool     stream_configured[TOTAL_STREAM_SLOTS];
 static bool     stream_streaming[TOTAL_STREAM_SLOTS];
@@ -182,7 +188,7 @@ lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
 
         int offset = 0;
 
-        /* CASE 1: Single-CIS / Single-BIS Multiplexed Stereo (2 channels packed in 1 SDU) */
+        /* CASE 1: Single-CIS / Single-BIS Multiplexed Stereo (2 channels in 1 SDU) */
         if (chans == 2 && lc3_decoders[0] != NULL && lc3_decoders[1] != NULL)
         {
             for (int b = 0; b < f_blocks; b++)
@@ -199,7 +205,7 @@ lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
             continue;
         }
 
-        /* CASE 2: Dual-CIS / Dual-BIS Split Stereo (Left and Right links actively streaming) */
+        /* CASE 2: Dual-CIS / Dual-BIS Split Stereo (Sequence-Number Locked) */
         if (count_streaming_streams() >= 2 && lc3_decoders[0] != NULL && lc3_decoders[1] != NULL)
         {
             bool right_ch = is_right_stream[idx];
@@ -211,38 +217,79 @@ lc3_worker_thread_fn(void *arg1, void *arg2, void *arg3)
 
                 if (!right_ch)
                 {
+                    /* Incoming Left channel packet */
                     if (left_staged)
                     {
+                        /* A previous Left frame waited but its Right counterpart never arrived.
+                         * Synthesize PLC for Right on the older sequence so audio does not stall. */
                         decode_single_channel(
                             lc3_decoders[1], SDU_STATUS_LOST_PLC, NULL, octets, pcm_right_buf, n_samples);
                         audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
-                        left_staged  = false;
-                        right_staged = false;
+                        left_staged = false;
+                    }
+
+                    if (right_staged)
+                    {
+                        int16_t diff = (int16_t)(pkt.seq_num - staged_right_seq);
+                        if (diff > 0)
+                        {
+                            /* The staged Right packet is older than this new Left packet.
+                             * Flush the stale Right packet with PLC Left and clear it. */
+                            decode_single_channel(
+                                lc3_decoders[0], SDU_STATUS_LOST_PLC, NULL, octets, pcm_left_buf, n_samples);
+                            audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                            right_staged = false;
+                        }
                     }
 
                     decode_single_channel(lc3_decoders[0], pkt.status, frame_ptr, octets, pcm_left_buf, n_samples);
-                    left_staged = true;
+                    staged_left_seq = pkt.seq_num;
+                    left_staged     = true;
                 }
                 else
                 {
+                    /* Incoming Right channel packet */
                     if (right_staged)
                     {
                         decode_single_channel(
                             lc3_decoders[0], SDU_STATUS_LOST_PLC, NULL, octets, pcm_left_buf, n_samples);
                         audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
-                        left_staged  = false;
                         right_staged = false;
                     }
 
+                    if (left_staged)
+                    {
+                        int16_t diff = (int16_t)(pkt.seq_num - staged_left_seq);
+                        if (diff < 0)
+                        {
+                            /* This Right packet arrived late: its matching Left frame was already
+                             * rendered. Discard it immediately so it never skews stereo timing. */
+                            continue;
+                        }
+                        if (diff > 0)
+                        {
+                            /* Staged Left packet is older: flush it with PLC Right first */
+                            decode_single_channel(
+                                lc3_decoders[1], SDU_STATUS_LOST_PLC, NULL, octets, pcm_right_buf, n_samples);
+                            audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                            left_staged = false;
+                        }
+                    }
+
                     decode_single_channel(lc3_decoders[1], pkt.status, frame_ptr, octets, pcm_right_buf, n_samples);
-                    right_staged = true;
+                    staged_right_seq = pkt.seq_num;
+                    right_staged     = true;
                 }
 
+                /* Strict pairing: only output when sequence numbers match */
                 if (left_staged && right_staged)
                 {
-                    audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
-                    left_staged  = false;
-                    right_staged = false;
+                    if (staged_left_seq == staged_right_seq)
+                    {
+                        audio_i2s_write_stereo_frame(pcm_left_buf, pcm_right_buf, n_samples);
+                        left_staged  = false;
+                        right_staged = false;
+                    }
                 }
             }
             continue;
@@ -306,10 +353,9 @@ ble_audio_stream_configure(struct bt_bap_stream *stream, const struct bt_audio_c
         is_right_stream[idx]     = has_right ? true : (has_left ? false : ((idx % 2) == 1));
     }
 
-    int blocks            = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
-    frames_per_sdu[idx]   = (blocks > 0) ? blocks : 1;
-    octets_per_frame[idx] = len_ret;
-    /* Output PCM is always rendered at DAC_SAMPLE_RATE (48 kHz) */
+    int blocks             = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
+    frames_per_sdu[idx]    = (blocks > 0) ? blocks : 1;
+    octets_per_frame[idx]  = len_ret;
     samples_per_frame[idx] = (size_t)((frame_duration_us * DAC_SAMPLE_RATE) / USEC_PER_SEC);
 
     if (samples_per_frame[idx] > MAX_NUM_SAMPLES)
@@ -363,8 +409,10 @@ ble_audio_stream_cleanup(struct bt_bap_stream *stream)
     samples_per_frame[idx]   = 0;
     seq_initialized[idx]     = false;
 
-    left_staged  = false;
-    right_staged = false;
+    left_staged      = false;
+    right_staged     = false;
+    staged_left_seq  = 0;
+    staged_right_seq = 0;
 
     if (count_configured_streams() == 0 && count_streaming_streams() == 0)
     {
@@ -419,7 +467,7 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
         return;
     }
 
-    /* Unicast guard: ensure packet belongs to the active connection */
+    /* Unicast guard: packet must belong to the active connection */
     if (!is_broadcast_slot(idx))
     {
         if (!ble_conn_control_is_active_conn(stream->conn))
@@ -436,19 +484,23 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
         }
     }
 
+    uint16_t gap = 0U;
     if (seq_initialized[idx])
     {
-        uint16_t gap = (uint16_t)(info->seq_num - expected_seq_num[idx]);
+        gap = (uint16_t)(info->seq_num - expected_seq_num[idx]);
         if (gap > 0 && gap <= 4)
         {
             struct lc3_sdu_packet plc_pkt = {
                 .stream_idx = (uint8_t)idx,
                 .status     = SDU_STATUS_LOST_PLC,
+                .seq_num    = (uint16_t)(expected_seq_num[idx]),
                 .len        = 0,
             };
             for (uint16_t g = 0; g < gap; g++)
             {
+                plc_pkt.seq_num = (uint16_t)(expected_seq_num[idx] + g);
                 k_msgq_put(&lc3_rx_msgq, &plc_pkt, K_NO_WAIT);
+                audio_telemetry_record_sdu(false, true, (g == 0U) ? gap : 0U);
             }
         }
     }
@@ -460,22 +512,26 @@ stream_recv(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info, s
 
     struct lc3_sdu_packet pkt;
     pkt.stream_idx = (uint8_t)idx;
+    pkt.seq_num    = (uint16_t)info->seq_num;
 
     if (flag_valid && buf != NULL && buf->len >= required_len && required_len > 0 && required_len <= MAX_SDU_BUF_SIZE)
     {
         pkt.status = SDU_STATUS_VALID_DATA;
         pkt.len    = (uint16_t)required_len;
         memcpy(pkt.data, buf->data, required_len);
+        audio_telemetry_record_sdu(true, false, 0U);
     }
     else if (flag_valid && (buf == NULL || buf->len == 0))
     {
         pkt.status = SDU_STATUS_SILENCE;
         pkt.len    = 0;
+        audio_telemetry_record_sdu(false, false, 0U);
     }
     else
     {
         pkt.status = SDU_STATUS_LOST_PLC;
         pkt.len    = 0;
+        audio_telemetry_record_sdu(false, true, 0U);
     }
 
     k_msgq_put(&lc3_rx_msgq, &pkt, K_NO_WAIT);
@@ -490,7 +546,6 @@ stream_started(struct bt_bap_stream *stream)
         return;
     }
 
-    /* Broadcast streams bypass ASCS lc3_enable, so configure decoder directly from stream->codec_cfg */
     if (!stream_configured[idx] && stream->codec_cfg != NULL)
     {
         if (ble_audio_stream_configure(stream, stream->codec_cfg) != 0)
@@ -504,6 +559,8 @@ stream_started(struct bt_bap_stream *stream)
     stream_streaming[idx] = true;
     left_staged           = false;
     right_staged          = false;
+    staged_left_seq       = 0;
+    staged_right_seq      = 0;
 
     LOG_INF("Audio Stream %p (idx %d, %s) streaming link active",
             stream,

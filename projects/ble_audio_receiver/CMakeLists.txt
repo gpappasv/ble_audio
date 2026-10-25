@@ -6,6 +6,9 @@ project(ble_audio_receiver)
 # Clean, scannable, properly indented compilation targets
 target_sources(app PRIVATE
     src/main.c
+    src/dsp/audio_dsp.c
+    src/diag/audio_telemetry.c
+    src/hw/board_buttons.c
     src/dac/audio_i2s.c
     src/ble/ble_conn_control.c
     src/ble/ble_audio_stream.c
