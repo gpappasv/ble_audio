@@ -1,5 +1,7 @@
 #include "ble_conn_control.h"
+#include "ble_audio_stream.h"
 #include "ble_bap_unicast_server.h"
+#include "ble_bap_broadcast_sink.h"
 #include "../dac/audio_i2s.h"
 
 #include <zephyr/kernel.h>
@@ -16,9 +18,8 @@
 
 LOG_MODULE_REGISTER(ble_conn, LOG_LEVEL_INF);
 
-static struct bt_conn       *active_conn    = NULL;
-static struct bt_conn       *displaced_conn = NULL;
-static struct bt_le_ext_adv *adv            = NULL;
+static struct bt_conn       *active_conn = NULL;
+static struct bt_le_ext_adv *adv         = NULL;
 
 static struct k_work_delayable adv_work;
 static struct k_work_delayable sec_work;
@@ -36,14 +37,21 @@ static uint8_t unicast_server_addata[] = {
     0x00,                       // Metadata length
 };
 
+/* Broadcast Audio Scan Service (BASS) announcement so phone Assistant detects Auracast support */
+static uint8_t bass_addata[] = {
+    BT_UUID_16_ENCODE(BT_UUID_BASS_VAL),
+};
+
 static const struct bt_data ad[] = {
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
     BT_DATA_BYTES(BT_DATA_UUID16_ALL,
                   BT_UUID_16_ENCODE(BT_UUID_ASCS_VAL),
+                  BT_UUID_16_ENCODE(BT_UUID_BASS_VAL),
                   BT_UUID_16_ENCODE(BT_UUID_CAS_VAL),
                   BT_UUID_16_ENCODE(BT_UUID_PACS_VAL),
                   BT_UUID_16_ENCODE(BT_UUID_VCS_VAL)),
     BT_DATA(BT_DATA_SVC_DATA16, unicast_server_addata, ARRAY_SIZE(unicast_server_addata)),
+    BT_DATA(BT_DATA_SVC_DATA16, bass_addata, ARRAY_SIZE(bass_addata)),
     BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME, sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
@@ -57,11 +65,7 @@ static void
 adv_work_handler(struct k_work *work)
 {
     ARG_UNUSED(work);
-
-    if (displaced_conn == NULL)
-    {
-        start_adv();
-    }
+    start_adv();
 }
 
 static void
@@ -120,41 +124,14 @@ connected(struct bt_conn *conn, uint8_t err)
         return;
     }
 
-    if (active_conn != NULL && active_conn != conn)
+    LOG_INF("Connected: %s", addr);
+    if (active_conn != NULL)
     {
-        char old_addr[BT_ADDR_LE_STR_LEN];
-        bt_addr_le_to_str(bt_conn_get_dst(active_conn), old_addr, sizeof(old_addr));
-        LOG_INF("Smart Connect takeover: %s displacing active device %s", addr, old_addr);
-
-        ble_bap_unicast_server_evict_conn(active_conn);
-        audio_i2s_stop();
-
-        if (displaced_conn != NULL)
-        {
-            bt_conn_unref(displaced_conn);
-            displaced_conn = NULL;
-        }
-
-        displaced_conn = active_conn;
-        active_conn    = bt_conn_ref(conn);
-
-        int disc_err = bt_conn_disconnect(displaced_conn, BT_HCI_ERR_REMOTE_USER_TERM_CONN);
-        if (disc_err)
-        {
-            LOG_WRN("Disconnect of displaced conn returned %d", disc_err);
-            bt_conn_unref(displaced_conn);
-            displaced_conn = NULL;
-        }
+        bt_conn_unref(active_conn);
     }
-    else
-    {
-        LOG_INF("Connected: %s", addr);
-        if (active_conn != NULL)
-        {
-            bt_conn_unref(active_conn);
-        }
-        active_conn = bt_conn_ref(conn);
-    }
+    active_conn = bt_conn_ref(conn);
+
+    ble_bap_broadcast_sink_on_connected(conn);
 
     k_work_reschedule(&sec_work, K_MSEC(350));
 }
@@ -165,27 +142,21 @@ disconnected(struct bt_conn *conn, uint8_t reason)
     char addr[BT_ADDR_LE_STR_LEN];
     bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
-    if (conn == displaced_conn)
-    {
-        LOG_INF("Displaced device disconnected cleanly: %s (reason 0x%02x)", addr, reason);
-        bt_conn_unref(displaced_conn);
-        displaced_conn = NULL;
-
-        k_work_reschedule(&adv_work, K_MSEC(250));
-        return;
-    }
-
     if (conn == active_conn)
     {
         LOG_INF("Active device disconnected: %s (reason 0x%02x)", addr, reason);
         k_work_cancel_delayable(&sec_work);
 
         ble_bap_unicast_server_evict_conn(active_conn);
-        audio_i2s_stop();
+        if (!ble_audio_stream_has_active_broadcast())
+        {
+            audio_i2s_stop();
+        }
 
         bt_conn_unref(active_conn);
         active_conn = NULL;
 
+        ble_bap_broadcast_sink_resume();
         k_work_reschedule(&adv_work, K_MSEC(150));
         return;
     }
@@ -305,8 +276,10 @@ ble_conn_control_start(void)
         LOG_INF("Persistent Bluetooth identity and bonds loaded from flash");
     }
 
+    ble_audio_stream_init();
     ble_bap_unicast_server_start();
+    ble_bap_broadcast_sink_start();
 
-    LOG_INF("Bluetooth initialized");
+    LOG_INF("Bluetooth initialized (Unicast Server + BASS Auracast Sink)");
     start_adv();
 }

@@ -6,9 +6,11 @@ project(ble_audio_receiver)
 # Clean, scannable, properly indented compilation targets
 target_sources(app PRIVATE
     src/main.c
-    src/ble/ble_conn_control.c
-    src/ble/ble_bap_unicast_server.c
     src/dac/audio_i2s.c
+    src/ble/ble_conn_control.c
+    src/ble/ble_audio_stream.c
+    src/ble/ble_bap_unicast_server.c
+    src/ble/ble_bap_broadcast_sink.c
 )
 
 # Architectural Best Practice: Expose your source root globally.
