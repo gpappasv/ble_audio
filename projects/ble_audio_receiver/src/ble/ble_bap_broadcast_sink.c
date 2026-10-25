@@ -1,6 +1,7 @@
 #include "ble_bap_broadcast_sink.h"
 #include "ble_audio_stream.h"
 #include "../dac/audio_i2s.h"
+#include "../hw/board_leds.h"
 
 #include <zephyr/kernel.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -182,6 +183,11 @@ teardown_pa_and_sink(void)
             LOG_INF("BASS source %u purged from Scan Delegator", src_to_rem);
         }
     }
+    else
+    {
+        has_active_src_id = false;
+        active_src_id     = 0;
+    }
 
     pending_full_reset = false;
     big_stopping       = false;
@@ -202,6 +208,11 @@ teardown_pa_and_sink(void)
 
     ble_audio_stream_reset_broadcast();
     audio_i2s_stop();
+
+    if (!ble_audio_stream_has_active_unicast())
+    {
+        board_leds_set_state(LED_STATE_CONNECTED_IDLE);
+    }
 
     base_bis_bitfield   = 0;
     base_bis_count      = 0;
@@ -239,6 +250,7 @@ pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_i
             target_broadcast_id);
 
     notify_phone_pa_state(BT_BAP_PA_STATE_SYNCED);
+    board_leds_set_state(LED_STATE_AURACAST_SYNCING);
 
     if (broadcast_sink != NULL)
     {
@@ -259,6 +271,7 @@ pa_synced_cb(struct bt_le_per_adv_sync *sync, struct bt_le_per_adv_sync_synced_i
         if (err != 0)
         {
             LOG_ERR("Failed creating Broadcast Sink (err %d)", err);
+            board_leds_notify_event(LED_EVT_ERROR);
             k_work_submit(&cleanup_work);
             return;
         }
@@ -278,6 +291,29 @@ pa_term_cb(struct bt_le_per_adv_sync *sync, const struct bt_le_per_adv_sync_term
 
     notify_phone_bis_state(0U);
     notify_phone_pa_state(BT_BAP_PA_STATE_NOT_SYNCED);
+
+    /* Autonomous Out-of-Range Re-acquisition:
+     * If termination was an unexpected RF timeout (not user teardown or unicast preemption),
+     * attempt an 8-second background re-lock before giving up. */
+    if (!pending_full_reset && !suspended_by_unicast && requested_bis_sync != 0U
+        && target_broadcast_id != INVALID_BROADCAST_ID)
+    {
+        LOG_INF("Signal lost -> attempting autonomous Auracast re-acquisition (8s window)...");
+        if (broadcast_sink != NULL)
+        {
+            bt_bap_broadcast_sink_delete(broadcast_sink);
+            broadcast_sink = NULL;
+        }
+        big_synced    = false;
+        big_stopping  = false;
+        base_received = false;
+        sink_syncable = false;
+        audio_i2s_stop();
+        board_leds_set_state(LED_STATE_AURACAST_SYNCING);
+        k_work_reschedule(&pa_create_work, K_MSEC(250));
+        return;
+    }
+
     k_work_submit(&cleanup_work);
 }
 
@@ -417,6 +453,8 @@ pa_sync_req_cb(struct bt_conn                                *conn,
             past_avail ? "YES" : "NO",
             active_src_id);
 
+    board_leds_set_state(LED_STATE_AURACAST_SYNCING);
+
     if (pa_sync != NULL)
     {
         if (same_broadcaster)
@@ -499,7 +537,6 @@ bis_sync_req_cb(struct bt_conn                                *conn,
 
     if (req_bits == 0U)
     {
-        /* Normal in-session pause: stop BIG stream but keep PA and source alive */
         requested_bis_sync = 0U;
         notify_phone_bis_state(0U);
         if (big_synced && !big_stopping && broadcast_sink != NULL)
@@ -508,6 +545,7 @@ bis_sync_req_cb(struct bt_conn                                *conn,
             bt_bap_broadcast_sink_stop(broadcast_sink);
         }
         audio_i2s_stop();
+        board_leds_set_state(LED_STATE_CONNECTED_IDLE);
         return 0;
     }
 
@@ -556,6 +594,7 @@ pa_create_work_handler(struct k_work *work)
     if (err != 0)
     {
         LOG_ERR("Failed creating PA sync (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
         notify_phone_pa_state(BT_BAP_PA_STATE_FAILED);
         return;
     }
@@ -566,6 +605,7 @@ pa_create_work_handler(struct k_work *work)
         scanning_for_pa = true;
     }
 
+    board_leds_set_state(LED_STATE_AURACAST_SYNCING);
     LOG_INF("Waiting for Periodic Advertising lock...");
     k_work_reschedule(&watchdog_work, K_MSEC(PA_SYNC_TIMEOUT_MS));
 }
@@ -621,6 +661,7 @@ big_sync_work_handler(struct k_work *work)
     if (err != 0)
     {
         LOG_ERR("Failed syncing to Broadcast Sink BIG (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
         notify_phone_bis_state(BT_BAP_BIS_SYNC_FAILED);
         return;
     }
@@ -670,6 +711,7 @@ watchdog_work_handler(struct k_work *work)
     if (pa_sync != NULL && broadcast_sink == NULL)
     {
         LOG_WRN("Periodic Advertising lock timed out; cleaning up");
+        board_leds_notify_event(LED_EVT_ERROR);
         notify_phone_pa_state(BT_BAP_PA_STATE_FAILED);
         k_work_submit(&cleanup_work);
     }
@@ -702,7 +744,7 @@ ble_bap_broadcast_sink_suspend(void)
     if (had_activity)
     {
         audio_i2s_stop();
-        LOG_INF("Auracast Broadcast Sink suspended for Unicast stream");
+        LOG_INF("Auracast Broadcast Sink terminated for Unicast stream");
     }
 }
 

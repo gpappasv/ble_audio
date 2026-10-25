@@ -1,55 +1,55 @@
-// --- includes ----------------------------------------------------------------
-#include "ble/ble_conn_control.h"
 #include "dac/audio_i2s.h"
+#include "hw/board_buttons.h"
+#include "hw/board_leds.h"
+#include "ble/ble_audio_stream.h"
+#include "ble/ble_bap_unicast_server.h"
+#include "ble/ble_bap_broadcast_sink.h"
+#include "ble/ble_conn_control.h"
 
 #include <zephyr/kernel.h>
+#include <zephyr/bluetooth/bluetooth.h>
+#include <zephyr/settings/settings.h>
 #include <zephyr/logging/log.h>
-#include <hal/nrf_clock.h>
 
-LOG_MODULE_REGISTER(main_m, LOG_LEVEL_INF);
-
-static void
-init_hardware_clocks(void)
-{
-    /* 1. Run Application Core Cortex-M33 at full 128 MHz (Div1 instead of default 64 MHz Div2) */
-    nrf_clock_hfclk_div_set(NRF_CLOCK, NRF_CLOCK_HFCLK_DIV_1);
-
-    /* 2. Lock the 32 MHz external crystal (HFXO) permanently on so the Audio PLL
-     *    never falls back to the internal RC oscillator (HFINT) between BLE events. */
-    if (!nrf_clock_hf_is_running(NRF_CLOCK, NRF_CLOCK_HFCLK_HIGH_ACCURACY))
-    {
-        nrf_clock_event_clear(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED);
-        nrf_clock_task_trigger(NRF_CLOCK, NRF_CLOCK_TASK_HFCLKSTART);
-
-        for (int i = 0; i < 500; i++)
-        {
-            if (nrf_clock_event_check(NRF_CLOCK, NRF_CLOCK_EVENT_HFCLKSTARTED)
-                || nrf_clock_hf_is_running(NRF_CLOCK, NRF_CLOCK_HFCLK_HIGH_ACCURACY))
-            {
-                break;
-            }
-            k_busy_wait(10);
-        }
-    }
-
-    LOG_INF("App Core running at 128 MHz, HFXO crystal locked");
-}
+LOG_MODULE_REGISTER(main, LOG_LEVEL_INF);
 
 int
 main(void)
 {
-    init_hardware_clocks();
+    int err;
 
-    audio_i2s_init(48000);
+    LOG_INF("=== AuraLink LE Audio Receiver Starting ===");
 
-    ble_conn_control_start();
+    board_leds_init();
 
-    LOG_INF("Main application execution environment loaded cleanly");
-
-    while (1)
+    err = audio_i2s_init();
+    if (err != 0)
     {
-        k_sleep(K_FOREVER);
+        LOG_ERR("Audio I2S / DSP subsystem init failed (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
+        return err;
     }
 
+    board_buttons_init();
+
+    err = bt_enable(NULL);
+    if (err != 0)
+    {
+        LOG_ERR("Bluetooth stack init failed (err %d)", err);
+        board_leds_notify_event(LED_EVT_ERROR);
+        return err;
+    }
+
+    if (IS_ENABLED(CONFIG_SETTINGS))
+    {
+        settings_load();
+    }
+
+    ble_audio_stream_init();
+    ble_bap_unicast_server_start();
+    ble_bap_broadcast_sink_start();
+    ble_conn_control_init();
+
+    LOG_INF("=== AuraLink Ready (Unicast + Auracast Sink) ===");
     return 0;
 }
