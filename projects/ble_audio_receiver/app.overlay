@@ -1,0 +1,38 @@
+/ {
+    aliases {
+        i2s-tx = &i2s0;
+    };
+};
+
+/* 1. Tune the nRF5340 Audio PLL to 12.288 MHz */
+&clock {
+    status = "okay";
+    hfclkaudio-frequency = <12288000>;
+};
+
+&pinctrl {
+    i2s0_default: i2s0_default {
+        group1 {
+            psels = <NRF_PSEL(I2S_SCK_M, 1, 13)>, /* BCLK  -> P1.13 */
+                    <NRF_PSEL(I2S_LRCK_M, 1, 14)>, /* WSEL  -> P1.14 */
+                    <NRF_PSEL(I2S_SDOUT, 1, 12)>;  /* DIN   -> P1.12 */
+        };
+    };
+
+    i2s0_sleep: i2s0_sleep {
+        group1 {
+            psels = <NRF_PSEL(I2S_SCK_M, 1, 13)>,
+                    <NRF_PSEL(I2S_LRCK_M, 1, 14)>,
+                    <NRF_PSEL(I2S_SDOUT, 1, 12)>;
+            low-power-enable;
+        };
+    };
+};
+
+&i2s0 {
+    status = "okay";
+    pinctrl-0 = <&i2s0_default>;
+    pinctrl-1 = <&i2s0_sleep>;
+    pinctrl-names = "default", "sleep";
+    clock-source = "ACLK";
+};
