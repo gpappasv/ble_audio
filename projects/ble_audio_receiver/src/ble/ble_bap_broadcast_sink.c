@@ -166,7 +166,7 @@ teardown_pa_and_sink(void)
     notify_phone_pa_state(BT_BAP_PA_STATE_NOT_SYNCED);
 
     /* 3. Purge the BASS source slot so Android doesn't see a lingering 'paused' stream */
-    if (has_active_src_id)
+    if (has_active_src_id && active_src_id != 0U)
     {
         uint8_t src_to_rem = active_src_id;
         has_active_src_id  = false;
