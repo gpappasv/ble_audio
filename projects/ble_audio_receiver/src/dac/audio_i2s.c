@@ -28,54 +28,50 @@ LOG_MODULE_REGISTER(audio_i2s, LOG_LEVEL_INF);
 #define BLOCK_SIZE_BYTES      (BLOCK_SAMPLE_PAIRS * BYTES_PER_SAMPLE_PAIR)
 
 /* 20 total DMA blocks (200 ms absorption headroom) */
-#define NUM_DMA_BLOCKS     20U
-#define PREBUFFER_BLOCKS   8U
-#define TARGET_DMA_BLOCKS  8U
-#define IDLE_CLOCK_GATE_MS 3000U
+#define NUM_DMA_BLOCKS        20U
+#define PREBUFFER_BLOCKS      8U
+#define TARGET_DMA_BLOCKS     8U
+#define IDLE_CLOCK_GATE_MS    3000U
 
 K_MEM_SLAB_DEFINE_STATIC(i2s_tx_slab, BLOCK_SIZE_BYTES, NUM_DMA_BLOCKS, 4);
 
-static const struct device * const i2s_dev = DEVICE_DT_GET(I2S_DEV_NODE);
+static const struct device *const i2s_dev = DEVICE_DT_GET(I2S_DEV_NODE);
 
-static bool     i2s_configured  = false;
-static bool     i2s_streaming   = false;
-static bool     i2s_clock_gated = false;
-static uint32_t prebuf_cnt      = 0;
+static bool     i2s_configured    = false;
+static bool     i2s_streaming     = false;
+static bool     i2s_clock_gated   = false;
+static uint32_t prebuf_cnt        = 0;
 
-/* Filtered queue depth (Q8) & cooldown to eliminate slip/pad oscillation */
-static int32_t filtered_slabs_q8 = (int32_t)(TARGET_DMA_BLOCKS << 8);
-static uint8_t drift_cooldown    = 0;
+/* Filtered queue depth (Q8) */
+static int32_t  filtered_slabs_q8 = (int32_t)(TARGET_DMA_BLOCKS << 8);
 
 /* Staging accumulator for sample-accurate drift compensation & block packing */
-static int16_t staging_block[BLOCK_SAMPLE_PAIRS * NUM_CHANNELS];
-static size_t  staging_pair_idx = 0;
+static int16_t  staging_block[BLOCK_SAMPLE_PAIRS * NUM_CHANNELS];
+static size_t   staging_pair_idx  = 0;
 
 /* Intermediate DSP output buffers */
-static int16_t dsp_left[BLOCK_SAMPLE_PAIRS];
-static int16_t dsp_right[BLOCK_SAMPLE_PAIRS];
+static int16_t  dsp_left[BLOCK_SAMPLE_PAIRS];
+static int16_t  dsp_right[BLOCK_SAMPLE_PAIRS];
 
 static struct k_work_delayable idle_gate_work;
 static K_MUTEX_DEFINE(i2s_lock);
 
 /**
- * @brief Scan the middle 50% of the stereo frame to locate the sample index
- *        with minimum slope (|dL| + |dR|) and minimum amplitude (zero crossing).
- *        Splicing 1 sample at a flat/zero-crossing point produces zero audible click.
+ * @brief Scan an acoustic sub-window to locate the sample index with minimum slope
+ *        (|dL| + |dR|) and minimum amplitude (zero crossing).
  */
 static size_t
-find_optimal_splice_index(const int16_t *l, const int16_t *r, size_t count)
+find_zero_crossing_in_range(const int16_t *l, const int16_t *r, size_t start, size_t end)
 {
-    if (count < 32U)
+    if (end <= start + 2U)
     {
-        return count / 2U;
+        return (start + end) / 2U;
     }
 
-    size_t  start    = count / 4U;
-    size_t  end      = count - start;
-    size_t  best_idx = count / 2U;
+    size_t  best_idx = (start + end) / 2U;
     int32_t min_cost = INT32_MAX;
 
-    for (size_t i = start; i < end; i++)
+    for (size_t i = start + 1U; i < end; i++)
     {
         int32_t dl         = (int32_t)l[i] - (int32_t)l[i - 1U];
         int32_t dr         = (int32_t)r[i] - (int32_t)r[i - 1U];
@@ -88,9 +84,9 @@ find_optimal_splice_index(const int16_t *l, const int16_t *r, size_t count)
         {
             min_cost = cost;
             best_idx = i;
-            if (cost <= 4)
+            if (cost <= 2)
             {
-                break; /* Quiet zero-crossing found */
+                break; /* Exact zero-crossing found */
             }
         }
     }
@@ -164,7 +160,7 @@ static void
 submit_dma_block(const int16_t *interleaved_samples)
 {
     void *mem_block = NULL;
-    int   err       = k_mem_slab_alloc(&i2s_tx_slab, &mem_block, K_NO_WAIT);
+    int err = k_mem_slab_alloc(&i2s_tx_slab, &mem_block, K_NO_WAIT);
     if (err != 0)
     {
         return;
@@ -200,7 +196,6 @@ submit_dma_block(const int16_t *interleaved_samples)
             {
                 i2s_streaming     = true;
                 filtered_slabs_q8 = (int32_t)(PREBUFFER_BLOCKS << 8);
-                drift_cooldown    = 0;
                 audio_telemetry_set_active(true);
                 LOG_INF("I2S DMA streaming started (%u frames prebuffered)", prebuf_cnt);
             }
@@ -282,10 +277,10 @@ audio_i2s_write_stereo_frame(const int16_t *left, const int16_t *right, size_t n
     /* 1. Run DSP conditioning (DC blocker, PLC burst envelope, log volume, soft-knee, SSAT) */
     audio_dsp_process_stereo(left, right, dsp_left, dsp_right, clamped_samples);
 
-    /* 2. Low-Pass Filtered Drift Controller with Zero-Crossing Splice Selection */
+    /* 2. Multi-Tier Zero-Crossing Drift Controller */
     uint32_t used_slabs = k_mem_slab_num_used_get(&i2s_tx_slab);
-    bool     do_pad     = false;
-    bool     do_slip    = false;
+    uint8_t  do_pad     = 0;
+    uint8_t  do_slip    = 0;
 
     if (i2s_streaming)
     {
@@ -294,40 +289,83 @@ audio_i2s_write_stereo_frame(const int16_t *left, const int16_t *right, size_t n
         /* 16-frame exponential moving average filter on slab occupancy */
         filtered_slabs_q8 += (((int32_t)used_slabs << 8) - filtered_slabs_q8) >> 4;
 
-        if (drift_cooldown > 0U)
-        {
-            drift_cooldown--;
-        }
-
         if (clamped_samples >= 240U)
         {
             if (used_slabs <= 3U)
             {
-                /* Low-buffer guard: pad 1 sample every frame until above 3 slabs */
-                do_pad = true;
+                /* Emergency starvation guard: +6250 ppm */
+                do_pad = 3;
             }
-            else if (used_slabs <= 6U && filtered_slabs_q8 < (int32_t)(7 << 8) && drift_cooldown == 0U)
+            else if (used_slabs <= 5U)
             {
-                /* Gentle steady-state pad: max 1 sample per frame */
-                do_pad         = true;
-                drift_cooldown = 0U;
+                /* Active recovery zone: +4166 ppm (overcomes +2392 ppm by +1774 ppm) */
+                do_pad = 2;
             }
-            else if (used_slabs >= 14U && filtered_slabs_q8 > (int32_t)(13 << 8) && drift_cooldown == 0U)
+            else if (used_slabs <= 7U)
             {
-                /* High-buffer guard: slip 1 sample with 1-frame cooldown */
-                do_slip        = true;
-                drift_cooldown = 1U;
+                /* Soft pacing zone: dynamic 2-sample or 1-sample recovery */
+                if (filtered_slabs_q8 < (int32_t)(7 << 8))
+                {
+                    do_pad = 2;
+                }
+                else
+                {
+                    do_pad = 1;
+                }
             }
-            /* Wide 7..13 slab deadband: zero intervention, zero hunting */
+            else if (used_slabs <= 9U)
+            {
+                /* Target 8-9 block sweet spot: pad 1 to track +2392 ppm closely */
+                do_pad = 1;
+            }
+            else if (used_slabs >= 15U)
+            {
+                do_slip = 2; /* -4166 ppm */
+            }
+            else if (used_slabs >= 12U)
+            {
+                do_slip = 1; /* -2083 ppm */
+            }
+            /* used_slabs == 10, 11: neutral deadband, do_pad = 0, do_slip = 0 */
         }
     }
 
-    size_t splice_idx
-        = (do_pad || do_slip) ? find_optimal_splice_index(dsp_left, dsp_right, clamped_samples) : clamped_samples;
+    size_t pad_idx[3]  = { 0 };
+    size_t slip_idx[2] = { 0 };
+
+    /* Discover optimal zero-crossing splice points across separated sub-regions */
+    if (do_pad == 1)
+    {
+        pad_idx[0] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 4U, (3U * clamped_samples) / 4U);
+    }
+    else if (do_pad == 2)
+    {
+        pad_idx[0] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 6U, clamped_samples / 2U);
+        pad_idx[1] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 2U, (5U * clamped_samples) / 6U);
+    }
+    else if (do_pad == 3)
+    {
+        pad_idx[0] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 8U, (3U * clamped_samples) / 8U);
+        pad_idx[1] = find_zero_crossing_in_range(dsp_left, dsp_right, (3U * clamped_samples) / 8U, (5U * clamped_samples) / 8U);
+        pad_idx[2] = find_zero_crossing_in_range(dsp_left, dsp_right, (5U * clamped_samples) / 8U, (7U * clamped_samples) / 8U);
+    }
+
+    if (do_slip == 1)
+    {
+        slip_idx[0] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 4U, (3U * clamped_samples) / 4U);
+    }
+    else if (do_slip == 2)
+    {
+        slip_idx[0] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 6U, clamped_samples / 2U);
+        slip_idx[1] = find_zero_crossing_in_range(dsp_left, dsp_right, clamped_samples / 2U, (5U * clamped_samples) / 6U);
+    }
+
+    uint8_t curr_pad  = 0;
+    uint8_t curr_slip = 0;
 
     for (size_t i = 0; i < clamped_samples; i++)
     {
-        if (do_slip && i == splice_idx)
+        if (curr_slip < do_slip && i == slip_idx[curr_slip])
         {
             if (i + 1U < clamped_samples)
             {
@@ -335,22 +373,17 @@ audio_i2s_write_stereo_frame(const int16_t *left, const int16_t *right, size_t n
                 dsp_right[i + 1U] = (int16_t)(((int32_t)dsp_right[i] + (int32_t)dsp_right[i + 1U]) / 2);
             }
             audio_telemetry_record_drift_correction(true);
+            curr_slip++;
             continue;
         }
 
-        if (do_pad && i == splice_idx)
+        if (curr_pad < do_pad && i == pad_idx[curr_pad])
         {
-            /* Smooth 3-point triangular micro-blend around the minimum-slope point */
-            int32_t prev_l = (int32_t)dsp_left[i - 1U];
-            int32_t curr_l = (int32_t)dsp_left[i];
-            int32_t prev_r = (int32_t)dsp_right[i - 1U];
-            int32_t curr_r = (int32_t)dsp_right[i];
-
-            int16_t interp_l = (int16_t)((prev_l + curr_l) / 2);
-            int16_t interp_r = (int16_t)((prev_r + curr_r) / 2);
-
+            int16_t interp_l = (int16_t)(((int32_t)dsp_left[i - 1U] + (int32_t)dsp_left[i]) / 2);
+            int16_t interp_r = (int16_t)(((int32_t)dsp_right[i - 1U] + (int32_t)dsp_right[i]) / 2);
             push_stereo_pair_to_staging(interp_l, interp_r);
             audio_telemetry_record_drift_correction(false);
+            curr_pad++;
         }
 
         push_stereo_pair_to_staging(dsp_left[i], dsp_right[i]);
@@ -368,7 +401,6 @@ audio_i2s_stop(void)
     staging_pair_idx  = 0;
     prebuf_cnt        = 0;
     filtered_slabs_q8 = (int32_t)(TARGET_DMA_BLOCKS << 8);
-    drift_cooldown    = 0;
 
     if (i2s_streaming)
     {
